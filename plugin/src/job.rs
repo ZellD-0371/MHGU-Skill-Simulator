@@ -26,6 +26,10 @@ pub struct Cond {
     pub event: bool,
     /// Also use reward armor (no smithy recipe) that is not owned yet
     pub reward: bool,
+    /// Also use deviant armor that is not owned yet (owned deviant armor is always used, from its start rank on)
+    pub deviant: bool,
+    /// Only armor and decorations the smithy lists right now (owned armor always counts; reward armor follows `reward`)
+    pub smithy: bool,
     /// Hunter gender: 1 male, 2 female (armor for the other gender is left out)
     pub sex: u8,
     pub min_def: u16,
@@ -33,10 +37,10 @@ pub struct Cond {
     pub fixed: [u16; PARTS],
     pub fixed_charm: Option<usize>,
     pub excluded: Vec<u16>,
+    /// Decorations the user excluded (separate from armor: the id ranges overlap)
+    pub excluded_jewels: Vec<u16>,
     /// Use this one charm instead of the owned charms (saved sets, extra skills/alternatives of unowned-charm results)
     pub charm_override: Option<Charm>,
-    /// Search mode 'Thorough': recommended sets exact down to defense too (slower, since higher-defense armor is not dropped)
-    pub thorough: bool,
 }
 
 impl Cond {
@@ -45,7 +49,7 @@ impl Cond {
         use alloc::format;
         let list = |v: &[u16]| v.iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(",");
         format!(
-            "{}#{}#{}#{}#{}{}{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}",
+            "{}#{}#{}#{}#{}{}{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}#{}",
             self.targets.iter().map(|(t, n)| format!("{}:{}", t, n)).collect::<Vec<_>>().join(","),
             list(&self.skill_ids),
             self.kind,
@@ -62,9 +66,11 @@ impl Cond {
             list(&self.fixed),
             self.fixed_charm.map_or(alloc::string::String::from("-"), |c| format!("{}", c)),
             list(&self.excluded),
-            self.thorough as u8,
             self.reward as u8,
             self.sex,
+            self.deviant as u8,
+            self.smithy as u8,
+            list(&self.excluded_jewels),
         )
     }
 }
@@ -235,6 +241,22 @@ struct Data {
     charm_ids: Vec<usize>,
     owned: Vec<u16>,
     negative: Vec<u16>,
+    /// Decorations allowed ('smithy only' list, minus excluded ones; sorted), None when every one up to the rank is allowed
+    jewel_ids: Option<Vec<u16>>,
+    /// Rarity priority in stages: excluded armor per stage (index = rarity cap), empty when not staged
+    stage_ex: Vec<Vec<u16>>,
+}
+
+/// Rarity priority with owned charms in stages (engine search.rs 'Rarity priority in stages')
+struct Stages {
+    /// Current rarity cap and the last one
+    cap: u8,
+    max: u8,
+    /// Free-slot query of the stages (its excluded list is replaced per stage)
+    query: Query<'static>,
+    /// Sets kept from finished stages (rarity order), and the current stage's non-dominated sets
+    kept: Vec<Set>,
+    best: Vec<Set>,
 }
 
 /// Time the progress bar shows 100% between the end of the owned-charm phase and the unowned-charm question
@@ -283,6 +305,9 @@ pub struct Job {
     pub charm_sig: Option<skillsim_engine::search::CharmSignature>,
     /// First-phase query kept until begin
     first_query: Option<Query<'static>>,
+    /// Rarity priority with owned charms: the owned-charm phase runs in stages
+    stages: Option<Stages>,
+    max_results: usize,
     /// The owned-charm phase was skipped from memory / number of sets seeded from earlier results
     pub owned_skipped: bool,
     pub seeded: usize,
@@ -316,7 +341,13 @@ impl Job {
                 }
             }
         }
-        let jewel_rank = c.ranks.iter().rposition(|&on| on).map_or(3, |i| i as u8 + 1);
+        // Rarity 11 is deviant armor only: let it through the rarity mask and filter it below by its start rank
+        if c.ranks.iter().any(|&on| on) {
+            rare_mask |= 1 << 11;
+        }
+        let jewels = db.jewel_use(&c.ranks, c.smithy, &c.excluded_jewels);
+        let jewel_rank = jewels.rank;
+        let jewel_ids: Option<Vec<u16>> = jewels.ids(db);
         let charm_ids: Vec<usize> = match (c.charm_override, c.fixed_charm) {
             (Some(_), _) => alloc::vec![usize::MAX],
             (None, Some(i)) if i < db.inv().charms.len() => alloc::vec![i],
@@ -329,6 +360,38 @@ impl Job {
             let owned = &db.inv().owned;
             excluded.extend(db.reward_armor.iter().copied().filter(|id| !owned.contains(id)));
         }
+        // Deviant armor: usable when an enabled rank is at or above its start rank, and (option on or owned)
+        let owned = &db.inv().owned;
+        // Arena / event (coin) armor: owned pieces are always used, the option adds the unowned ones
+        excluded.extend(
+            db.gd
+                .armor
+                .iter()
+                .filter(|a| (a.flags & FLAG_ARENA != 0 && !c.arena || a.flags & FLAG_EVENT_COIN != 0 && !c.event) && !owned.contains(&a.id))
+                .map(|a| a.id),
+        );
+        // Smithy only: armor with a recipe must be on the smithy list (or owned). Reward armor has no recipe: it follows `reward`.
+        if c.smithy {
+            if let Some(s) = db.inv().smithy.as_ref() {
+                excluded.extend(
+                    db.gd
+                        .armor
+                        .iter()
+                        .filter(|a| !owned.contains(&a.id) && !s.armor.contains(&a.id) && !db.reward_armor.contains(&a.id))
+                        .map(|a| a.id),
+                );
+            }
+        }
+        excluded.extend(
+            db.gd
+                .armor
+                .iter()
+                .filter(|a| {
+                    let start = a.deviant_rank() as usize;
+                    start > 0 && !(c.ranks[start - 1..].iter().any(|&on| on) && (c.deviant || owned.contains(&a.id)))
+                })
+                .map(|a| a.id),
+        );
         let data = Data {
             targets: c.targets.iter().map(|&(tree, need)| Target { tree, need }).collect(),
             excluded,
@@ -339,6 +402,8 @@ impl Job {
             charm_ids,
             owned: db.inv().owned.iter().copied().collect(),
             negative: db.negative_trees.clone(),
+            jewel_ids,
+            stage_ex: Vec::new(),
         };
         // The borrowed values are heap buffers of data. They do not change while the Job lives, and the searcher is dropped first.
         let st = |v: &[Target]| unsafe { core::mem::transmute::<&[Target], &'static [Target]>(v) };
@@ -351,15 +416,17 @@ impl Job {
             sex: if c.sex == 2 { 2 } else { 1 },
             rare_mask,
             weapon_slots: c.weapon,
-            exclude_flags: (if c.arena { 0 } else { FLAG_ARENA }) | (if c.event { 0 } else { FLAG_EVENT_COIN }),
+            // Coin armor is excluded by id above (owned pieces stay), not by flag
+            exclude_flags: 0,
             jewel_rank,
+            jewel_ids: data.jewel_ids.as_deref().map(|v| unsafe { core::mem::transmute::<&[u16], &'static [u16]>(v) }),
             priority: c.priority,
             forbid_negative: c.forbid,
             dominance: o.dominance,
-            // Searches that rank by defense must not drop armor with higher defense.
-            // 'Thorough' (exact defense for recommended sets) only with free-slot priority: with rarity priority it made the
-            // search up to ~50x larger (70M nodes for two skills, 2026-11-19), and defense priority keeps defense anyway.
-            keep_defense: c.priority == 1 || c.min_def > 0 || (c.thorough && c.priority == 0),
+            // Minimum defense needs the higher-defense armor kept. Free-slot priority keeps it too, so the recommended
+            // sets are exact down to defense ('thorough', always on since 2026-11-19); with rarity priority that made the
+            // search up to ~50x larger (70M nodes for two skills), so it is off there.
+            keep_defense: c.min_def > 0 || c.priority == 0,
             relaxed: true,
             fixed: c.fixed,
             excluded: su(&data.excluded),
@@ -377,9 +444,23 @@ impl Job {
         let needed_query = (o.allow_needed && c.fixed_charm.is_none() && c.charm_override.is_none())
             // The defense keeping of 'Thorough' is for recommended sets (collected only in the owned-charm phase): not used in the unowned-charm phase
             // (using it grew that phase from 3.91M to 58.8M nodes: 2026-11-18)
-            .then(|| Query { charm_kinds: Some(&gd.charm_kinds), keep_defense: c.priority == 1 || c.min_def > 0, ..q });
+            .then(|| Query { charm_kinds: Some(&gd.charm_kinds), keep_defense: c.min_def > 0, ..q });
         let start_needed = o.needed_only && needed_query.is_some();
         let (first_query, needed_query) = if start_needed { (needed_query.unwrap(), None) } else { (q, needed_query) };
+        // Rarity priority, owned charms, a full search (not 'first set only', not one charm like alternatives / extra skills)
+        let mut data = data;
+        let mut stages = None;
+        let first_query = if c.priority == 2 && !start_needed && !o.first && c.charm_override.is_none() {
+            let max = skillsim_engine::search::stage_max_rarity(&gd.armor);
+            data.stage_ex = (0..=max)
+                .map(|cap| data.excluded.iter().copied().chain(skillsim_engine::search::stage_excluded(&gd.armor, &data.owned, cap)).collect())
+                .collect();
+            let query = Query { priority: 0, ..first_query };
+            stages = Some(Stages { cap: 0, max, query, kept: Vec::new(), best: Vec::new() });
+            Query { excluded: su(&data.stage_ex[0]), ..query }
+        } else {
+            first_query
+        };
         let searcher = Searcher::new(&gd.armor, &gd.jewels, &first_query).ok()?;
         let charm_count = data.charms.len();
         let parallel = o.parallel && !o.first && HELPER_THREAD.load(Ordering::Acquire);
@@ -388,15 +469,16 @@ impl Job {
             use alloc::format;
             let j = |v: &[u16]| v.iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(",");
             format!(
-                "thorough={} kind={} sex={} weapon={} forbid={} rare={} jewelrank={} priority={} exflags={} mindef={} minres={} targets={} fixed={} excluded={} owned={} pareto={} max={} group={} dominance={} needed={} charms={}",
-                c.thorough as u8,
+                "thorough={} kind={} sex={} weapon={} forbid={} rare={} jewelrank={} jewels={} priority={} exflags={} mindef={} minres={} targets={} fixed={} excluded={} owned={} pareto={} max={} group={} dominance={} needed={} charms={}",
+                (c.priority == 0) as u8,
                 first_query.kind,
                 first_query.sex,
                 first_query.weapon_slots,
                 first_query.forbid_negative as u8,
                 first_query.rare_mask,
                 first_query.jewel_rank,
-                first_query.priority,
+                data.jewel_ids.as_deref().map_or(alloc::string::String::from("-"), j),
+                c.priority,
                 first_query.exclude_flags,
                 first_query.min_def,
                 first_query.min_res.iter().map(|r| r.map_or(alloc::string::String::from("-"), |v| format!("{}", v))).collect::<Vec<_>>().join(","),
@@ -445,6 +527,8 @@ impl Job {
             seeded: 0,
             charm_sig: None,
             first_query: None,
+            stages,
+            max_results: o.max,
             owned_ms: 0,
             owned_nodes: 0,
             ask_wait_ms: 0,
@@ -587,8 +671,13 @@ impl Job {
             return 1.; // The owned-charm phase was searched to the end
         }
         let Some(s) = self.searcher.as_ref() else { return 1. };
+        // Staged search: each stage an equal share
+        let share = |p: f32| match (&self.stages, self.needed) {
+            (Some(st), false) => ((st.cap as f32 + p) / (st.max as f32 + 1.)).min(0.999),
+            _ => p,
+        };
         if self.helpers == 0 {
-            return s.progress();
+            return share(s.progress());
         }
         // Split work: (finished torsos + each searcher's progress inside its current torso) / torso count
         let len = s.root_len().max(1) as f32;
@@ -605,7 +694,7 @@ impl Job {
                 part += v as f32 / 1e6;
             }
         }
-        ((claimed - active).max(0.) + part) / len
+        share(((claimed - active).max(0.) + part) / len)
     }
 
     /// Exchange the sets found so far with the helpers (for pruning, every SHARE_MS)
@@ -634,7 +723,11 @@ impl Job {
     pub fn found(&self) -> usize {
         // Searchers exchange found sets, so do not add them; take the larger (close to the total without overlap)
         let helper = (0..self.helpers).map(|i| HELPER_FOUND[i].load(Ordering::Relaxed) as usize).max().unwrap_or(0);
-        self.searcher.as_ref().map_or(0, |s| s.results().len()).max(helper)
+        let kept = match (&self.stages, self.needed) {
+            (Some(st), false) => st.kept.len(),
+            _ => 0,
+        };
+        kept + self.searcher.as_ref().map_or(0, |s| s.results().len()).max(helper)
     }
     /// (free slots, defense) of every result including grouped sets (for tests)
     pub fn flat_ranks(&self) -> Vec<(u8, u16)> {
@@ -687,7 +780,13 @@ impl Job {
                 if !self.join_helper(false) {
                     return;
                 }
-                let empty = self.searcher.as_ref().is_none_or(|s| s.results().is_empty());
+                if !self.needed && self.next_stage() {
+                    continue;
+                }
+                let empty = match (&self.stages, self.needed) {
+                    (Some(st), false) => st.kept.is_empty(),
+                    _ => self.searcher.as_ref().is_none_or(|s| s.results().is_empty()),
+                };
                 if !hit && empty && !self.needed && self.needed_query.is_some() {
                     self.owned_ms = clock::ms_since(self.started);
                     self.owned_nodes = self.nodes;
@@ -719,6 +818,38 @@ impl Job {
         }
     }
 
+    /// Staged search: keep the finished stage's sets of exactly its rarity, then start the next stage while the results
+    /// are not full. false when the stages are over (or not staged).
+    fn next_stage(&mut self) -> bool {
+        let gd = self.gd;
+        let (cap, max) = match &self.stages {
+            Some(st) => (st.cap, st.max),
+            None => return false,
+        };
+        let Some(s) = self.searcher.as_ref() else { return false };
+        let room = self.max_results.saturating_sub(self.stages.as_ref().map_or(0, |st| st.kept.len()));
+        let new: Vec<Set> = s
+            .sorted_results()
+            .iter()
+            .filter(|r| skillsim_engine::search::set_rarity(s, &gd.armor, &self.data.owned, r) == cap)
+            .take(room)
+            .map(|r| self.convert(gd, s, r))
+            .collect();
+        let best: Vec<Set> = s.front().iter().map(|r| self.convert(gd, s, r)).collect();
+        let st = self.stages.as_mut().unwrap();
+        st.kept.extend(new);
+        st.best = best;
+        if st.kept.len() >= self.max_results || cap >= max {
+            return false;
+        }
+        st.cap = cap + 1;
+        let q = Query { excluded: unsafe { core::mem::transmute::<&[u16], &'static [u16]>(&self.data.stage_ex[st.cap as usize]) }, ..st.query };
+        self.searcher = None;
+        self.searcher = Searcher::new(&gd.armor, &gd.jewels, &q).ok();
+        self.split_now(&q);
+        self.searcher.is_some()
+    }
+
     /// Continue searching: raise the limit (10 s first, then 20 s, then fixed at 30 s).
     pub fn resume(&mut self) {
         self.round += 1;
@@ -736,16 +867,34 @@ impl Job {
     }
 
     pub fn result(&self, db: &Db) -> Found {
+        // Staged owned-charm search: the kept sets (a search stopped mid-stage adds that stage's sets so far)
+        if let (Some(st), false) = (&self.stages, self.needed) {
+            let mut sets = st.kept.clone();
+            let mut best = st.best.clone();
+            if self.state != State::Done || !self.complete {
+                if let Some(s) = self.searcher.as_ref() {
+                    let room = self.max_results.saturating_sub(sets.len());
+                    sets.extend(
+                        s.sorted_results()
+                            .iter()
+                            .filter(|r| skillsim_engine::search::set_rarity(s, &db.gd.armor, &self.data.owned, r) == st.cap)
+                            .take(room)
+                            .map(|r| self.convert(db.gd, s, r)),
+                    );
+                    best = s.front().iter().map(|r| self.convert(db.gd, s, r)).collect();
+                }
+            }
+            return Found { sets, best, needed: false, complete: self.complete };
+        }
         let Some(s) = self.searcher.as_ref() else {
             return Found { sets: Vec::new(), best: Vec::new(), needed: self.needed, complete: self.complete };
         };
-        let sets = s.sorted_results().iter().map(|r| self.convert(db, s, r)).collect();
-        let best = s.front().iter().map(|r| self.convert(db, s, r)).collect();
+        let sets = s.sorted_results().iter().map(|r| self.convert(db.gd, s, r)).collect();
+        let best = s.front().iter().map(|r| self.convert(db.gd, s, r)).collect();
         Found { sets, best, needed: self.needed, complete: self.complete }
     }
 
-    fn convert(&self, db: &Db, s: &Searcher, r: &skillsim_engine::search::SetResult) -> Set {
-        let gd = db.gd;
+    fn convert(&self, gd: &skillsim_engine::data::GameData, s: &Searcher, r: &skillsim_engine::search::SetResult) -> Set {
         let parts = core::array::from_fn(|p| {
             let members = s.armor_members(p, r.groups[p]);
             let head = gd.armor[members[0] as usize].def;

@@ -8,7 +8,8 @@ simdata.bin (little-endian)
   skill  HHb x            skill_id, tree, threshold
   armor  HBBBBBB HH 4*(Hbx) 5b x   id, part(0..4), kind, sex, rare, slots, flags, def, maxdef, skills,
                                    Resistances (fire, water, thunder, ice, dragon)
-         flags: 1 = needs arena coins, 2 = needs event (collaboration) coins
+         flags: 1 = needs arena coins, 2 = needs event (collaboration) coins,
+                bits 2-3 = deviant armor start rank (1 low, 2 high, 3 G; 0 = not deviant)
   jewel  HBB Hbx Hbx      item_id, size, rank (1 low, 2 high, 3 G), positive(tree,pt), negative(tree,pt)
   charm  B                number of charm kinds, then per kind
          BBB x            second skill threshold, first candidate count, second candidate count
@@ -21,6 +22,8 @@ import struct
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+import gamedb
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "Database" / "mhxx_all_tables.json"
@@ -35,15 +38,19 @@ def main() -> int:
     for row in db["DB_SklTreetoAmr"]:
         armor_skills[row["Amr_ID"]].append((row["SklTree_ID"], row["Pt"]))
 
-    # Armor using coins as materials, told apart by item id (the names change with the Korean patch: 'Purupuru no Coin'
-    # broke the old Korean name match, and two English names do not end in 'Coin'). Arena coins: the 14 monster coins
-    # 2062-2075 and the Grandpaw coin 2815. Event (collaboration) coins: the rest.
-    arena_coins = set(range(2062, 2076)) | {2815}
-    event_coins = {2808, 2812, 2817, 2818, 2824, 2829, 2835, 2838, 2851, 2853}
-    coin_flag = {i: 1 for i in arena_coins} | {i: 2 for i in event_coins}
+    # Armor using coins as materials, told apart by item id (gamedb.ARENA_COINS / EVENT_COINS)
+    coin_flag = {i: 1 for i in gamedb.ARENA_COINS} | {i: 2 for i in gamedb.EVENT_COINS}
     armor_flags = defaultdict(int)
+    armor_items = defaultdict(list)
     for row in db["DB_ItmtoAmr"]:
         armor_flags[row["Amr_ID"]] |= coin_flag.get(row["Itm_ID"], 0)
+        armor_items[row["Amr_ID"]].append(row["Itm_ID"])
+    # Deviant armor: start rank in bits 2-3. Rarity 11 is used by deviant armor only (the plugin relies on this).
+    for row in db["DB_Amr"]:
+        rank = gamedb.deviant_rank(armor_items[row["Amr_ID"]])
+        if (rank > 0) != (row["Rare"] == 11):
+            raise SystemExit(f"희귀도 11과 이명 방어구가 어긋남: {row['Amr_ID']} rare {row['Rare']} rank {rank}")
+        armor_flags[row["Amr_ID"]] |= rank << 2
 
     blob = bytearray()
     skills = sorted(db["DB_Skl"], key=lambda r: r["Skl_ID"])
@@ -57,14 +64,40 @@ def main() -> int:
         for row in db[table]:
             rank = fold.get(row["Rank_ID"], 2)
             item_rank[row["Itm_ID"]] = min(item_rank.get(row["Itm_ID"], 9), rank)
+    # Decoration materials with no monster/gathering row, ranked from other checked sources (2026-11-22). Quest
+    # rewards are NOT used for every item: village 6-star 'Advanced:' quests reward high rank stones and would pull
+    # many high rank decorations down to low rank. Items without a checked source stay 'low' (printed below).
+    verified_rank = {
+        17: 1, 20: 1,          # Demondrug, Armorskin: combine Catalyst + Might/Adamant Seed (all low)
+        18: 1, 21: 1,          # Mega Demondrug, Mega Armorskin: combine Nourishing Extract + the above (low)
+        33: 2,                 # Hunter's Drink: village 10-star rewards; combine Hyper Extract (hall high, from 6 stars) + Catalyst
+        34: 1,                 # Catalyst: village 6-star reward; combine Bitterbug + Honey (low)
+        189: 1,                # Field Horn: village 1-star reward
+        300: 1,                # Blue Cutthroat: hall 3-star reward
+        327: 1, 1663: 1,       # Toxic Kumori, Sinister Cloth: Palico gathering (low)
+        328: 2, 1664: 2,       # Large Toxic Kumori, Sinister Darkcloth: Palico gathering (high)
+        354: 2,                # Irregular Stoutbone: special permit rewards (folded to high like the permit ranks above)
+        356: 1, 370: 1,        # Wyvern Fang, Silver Egg: village 2-star rewards
+        1444: 2,               # Deviljho Saliva: village 10-star reward
+        1598: 1,               # Nakarkos Skull: hall 3-star reward
+        1697: 1,               # Commendation: village 6-star reward
+        1698: 2,               # Commendation G: village 10-star reward
+    }
+    for item, rank in verified_rank.items():
+        if item in item_rank:
+            raise SystemExit(f"확인 등급표의 소재에 이미 출처가 있음: {item}")
+        item_rank[item] = rank
     recipe = defaultdict(list)
     for row in db["DB_ItmtoJew"]:
         recipe[row["Jew_ID"]].append(row["Itm_ID"])
 
     jewels = {}
+    guessed = set()
     for row in db["DB_Jew"]:
         # Rank of a recipe = the highest rank among its materials. Materials without source info (combinations etc.) count as low rank.
         rank = max([item_rank.get(i, 1) for i in recipe[row["Jew_ID"]]] or [1])
+        if rank < 3 and any(i not in item_rank for i in recipe[row["Jew_ID"]]):
+            guessed.add(row["Itm_ID"])
         pos = (row["SklTree1_ID"], row["SklTree1_Pt"])
         neg = (row["SklTree2_ID"] or 0, row["SklTree2_Pt"] or 0)
         if pos[1] <= 0 or neg[1] > 0:
@@ -121,7 +154,10 @@ def main() -> int:
     tsv("jewels.tsv", [(j[0][0], *item_names[j[0][0]]) for j in jewels])
     print("arena armor", sum(1 for v in armor_flags.values() if v & 1),
           "event-coin armor", sum(1 for v in armor_flags.values() if v & 2))
+    print("deviant armor", {r: sum(1 for v in armor_flags.values() if v >> 2 & 3 == r) for r in (1, 2, 3)})
     print("jewel ranks", {r: sum(1 for j in jewels if j[1] == r) for r in (1, 2, 3)})
+    # Below G rank, a recipe with an unchecked material may really need a higher rank
+    print("jewels ranked with unchecked materials", len(guessed), ", ".join(item_names[i][1] for i in sorted(guessed)))
 
     print(f"skills {len(skills)}  armor {len(armor)}  jewels {len(jewels)}  -> {len(blob)} bytes")
     return 0

@@ -10,6 +10,9 @@ pub const TREE_TALISMAN: u16 = 205;
 pub const FLAG_ARENA: u8 = 1;
 /// Armor that needs event (collaboration) coins to craft
 pub const FLAG_EVENT_COIN: u8 = 2;
+/// Bits 2-3 of the armor flags: deviant armor start rank (1 low, 2 high, 3 G; 0 = not deviant).
+/// Deviant armor is upgraded from one piece up to G rank, so it is usable from that rank on. Never put in exclude_flags.
+pub const DEVIANT_SHIFT: u8 = 2;
 
 pub const PARTS: usize = 5;
 /// Number of elemental resistances (fire, water, thunder, ice, dragon)
@@ -37,7 +40,7 @@ pub struct Armor {
     pub sex: u8,
     pub rare: u8,
     pub slots: u8,
-    /// FLAG_ARENA, FLAG_EVENT_COIN
+    /// FLAG_ARENA, FLAG_EVENT_COIN, deviant start rank (DEVIANT_SHIFT)
     pub flags: u8,
     /// Fully upgraded defense
     pub def: u16,
@@ -54,6 +57,10 @@ impl Armor {
     /// Torso-up parts are treated as having no slots (all 0 in the real data too).
     pub fn usable_slots(&self) -> u8 {
         if self.torso_up() { 0 } else { self.slots }
+    }
+    /// Deviant armor start rank (1 low, 2 high, 3 G), 0 for other armor
+    pub fn deviant_rank(&self) -> u8 {
+        self.flags >> DEVIANT_SHIFT & 3
     }
 }
 

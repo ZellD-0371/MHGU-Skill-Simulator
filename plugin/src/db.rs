@@ -45,8 +45,39 @@ pub struct Inv {
     pub equipped_jewels: Vec<(u16, u8)>,
     /// Item box + pouch quantities (game item number -> count)
     pub items: BTreeMap<u16, u32>,
+    /// What the smithy lists right now (inventory.rs smithy_unlock): armor ids with a recipe, decoration ids.
+    /// None when it could not be read (a bug: logged, and the 'smithy only' option refuses to search).
+    pub smithy: Option<Smithy>,
     /// Was it read from the game
     pub loaded: bool,
+}
+
+/// Which decorations a search (and the screens built on it) may use
+pub struct JewelUse<'a> {
+    pub rank: u8,
+    pub only: Option<&'a alloc::collections::BTreeSet<u16>>,
+    /// Decorations the user excluded
+    pub excluded: &'a [u16],
+}
+impl JewelUse<'_> {
+    pub fn allows(&self, j: &Jewel) -> bool {
+        j.rank <= self.rank && self.only.is_none_or(|s| s.contains(&j.id)) && !self.excluded.contains(&j.id)
+    }
+    /// The engine's decoration id list (sorted), None when every decoration up to the rank may be used
+    pub fn ids(&self, db: &Db) -> Option<Vec<u16>> {
+        (self.only.is_some() || !self.excluded.is_empty()).then(|| db.gd.jewels.iter().filter(|j| self.allows(j)).map(|j| j.id).collect())
+    }
+}
+
+/// Smithy list at the time the window opened
+#[derive(Default, Clone, PartialEq)]
+pub struct Smithy {
+    pub armor: alloc::collections::BTreeSet<u16>,
+    pub jewels: alloc::collections::BTreeSet<u16>,
+    /// Decoration recipes listed (the game lists recipes: one decoration can have several)
+    pub deco_recipes: u16,
+    /// Hash of both lists (part of the search memory keys)
+    pub sig: u64,
 }
 
 impl Db {
@@ -94,6 +125,21 @@ impl Db {
             categories,
             inv: Default::default(),
         })
+    }
+
+    /// Armor with a smithy recipe (the size of the 'smithy list' armor count in the log)
+    pub fn recipe_armor_count(&self) -> usize {
+        crate::generated::unlock::ARMOR_KEYS.iter().map(|r| r.0).collect::<alloc::collections::BTreeSet<u16>>().len()
+    }
+
+    /// Decorations a search may use: up to the highest enabled armor rank, with 'smithy only' also listed at the smithy,
+    /// and not excluded by the user
+    pub fn jewel_use<'a>(&'a self, ranks: &[bool; 3], smithy: bool, excluded: &'a [u16]) -> JewelUse<'a> {
+        JewelUse {
+            rank: ranks.iter().rposition(|&on| on).map_or(3, |i| i as u8 + 1),
+            only: if smithy { self.inv().smithy.as_ref().map(|s| &s.jewels) } else { None },
+            excluded,
+        }
     }
 
     pub fn inv(&self) -> &Inv {

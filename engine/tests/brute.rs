@@ -515,6 +515,7 @@ fn engine(case: &Case, m: &Mode) -> (Found, usize, Last) {
         weapon_slots: case.weapon_slots,
         exclude_flags: 0,
         jewel_rank: 3,
+        jewel_ids: None,
         priority: m.priority,
         forbid_negative: m.forbid,
         negative_trees: &case.neg_trees,
@@ -833,6 +834,12 @@ fn check_case(case: &Case, n: u64, st: &mut Stats) {
         if n % 3 == 0 {
             min_res[(n as usize + 2) % RES] = Some(0);
         }
+        // Conditions on every element (the search then walks coarse groups and expands them at the end)
+        if n % 5 == 1 {
+            for (e, m) in min_res.iter_mut().enumerate() {
+                *m = Some(((n / 5 + e as u64) % 5) as i8 - 3);
+            }
+        }
         let res_ok = |ids: &[u16; PARTS]| {
             (0..RES).all(|e| {
                 let sum: i32 = ids.iter().map(|id| armor_by_id(case, *id).res[e] as i32).sum();
@@ -845,6 +852,17 @@ fn check_case(case: &Case, n: u64, st: &mut Stats) {
         assert!(got.iter().all(|(k, v)| want.get(k) == Some(v)), "case {n}: 내성 조건 결과가 정답에 없다");
         assert_eq!(max_free(case, &got), max_free(case, &want), "case {n} forbid {forbid}: 내성 조건 최선 불일치");
         st.res_feasible += !want.is_empty() as u32;
+        // Resistance and minimum defense together (both in the joint value bound): median defense of the answer
+        if !want.is_empty() {
+            let mut defs: Vec<u16> = want.keys().map(|k| def_of(case, &k.0)).collect();
+            defs.sort();
+            let min_def = defs[defs.len() / 2];
+            let both: Found = want.iter().filter(|(k, _)| def_of(case, &k.0) >= min_def).map(|(k, v)| (*k, *v)).collect();
+            assert_eq!(engine(case, &Mode { min_res, min_def, ..exact }).0, both, "case {n} forbid {forbid}: 내성+방어력 결과 불일치");
+            let (got, _, _) = engine(case, &Mode { min_res, min_def, dominance: true, keep_defense: true, ..exact });
+            assert!(got.iter().all(|(k, v)| both.get(k) == Some(v)), "case {n}: 내성+방어력 결과가 정답에 없다");
+            assert_eq!(max_free(case, &got), max_free(case, &both), "case {n} forbid {forbid}: 내성+방어력 최선 불일치");
+        }
     }
 }
 
@@ -1073,6 +1091,7 @@ fn needed_charm(count: u64, seed: u64) {
             weapon_slots: case.weapon_slots,
             exclude_flags: 0,
             jewel_rank: 3,
+            jewel_ids: None,
             priority: 0,
             forbid_negative: forbid,
             negative_trees: &case.neg_trees,
@@ -1261,6 +1280,7 @@ fn real_worker(gd: &skillsim_engine::data::GameData, seed: u64, total: u64, t: u
             weapon_slots,
             exclude_flags: 0,
             jewel_rank: 3,
+            jewel_ids: None,
             priority: 0,
             forbid_negative: forbid,
             negative_trees: &negative_trees,

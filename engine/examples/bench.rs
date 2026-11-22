@@ -62,10 +62,10 @@ fn main() {
 
     let queries: [(&str, u8, &[&str]); 5] = [
         ("쉬움", 1, &["귀마개"]),
-        ("보통", 1, &["약점 특효", "간파+3", "초회심"]),
-        ("어려움", 1, &["예리도 레벨+2", "약점 특효", "초회심", "도전자+2", "업물"]),
-        ("거너", 2, &["관통탄・관통활UP", "장전 수UP", "간파+3", "약점 특효"]),
-        ("불가능", 1, &["예리도 레벨+2", "공격력UP【대】", "간파+3", "약점 특효", "초회심", "도전자+2", "고급 귀마개", "회피 성능+2"]),
+        ("보통", 1, &["약점 특효", "간파+3", "슈퍼회심"]),
+        ("어려움", 1, &["장인+2", "약점 특효", "슈퍼회심", "도전자+2", "명검"]),
+        ("거너", 2, &["관통탄/관통화살 강화", "장전 수UP", "간파+3", "약점 특효"]),
+        ("불가능", 1, &["장인+2", "공격력UP【대】", "간파+3", "약점 특효", "슈퍼회심", "도전자+2", "고급 귀마개", "회피 성능+2"]),
     ];
     // (name, forbid negatives, dominance pruning, relaxed, use charms, compare defense)
     let modes: [(&str, bool, bool, bool, bool, bool); 2] = [
@@ -85,6 +85,7 @@ fn main() {
                 weapon_slots: 2,
                 exclude_flags: 0,
                 jewel_rank: 3,
+                jewel_ids: None,
                 priority: 0,
                 forbid_negative: forbid,
                 negative_trees: &negative_trees,

@@ -24,6 +24,29 @@ CATEGORIES = [
     ('cat_special', [(139, 205)]),
 ]
 
+# Deviant armor (rarity 11, upgraded from one piece up to G rank) is told apart by the 'Hunting Seal 1' item its recipe
+# needs. Value = lowest rank where the first special permit quest (which gives 2 of that seal) can be taken:
+#   low:  Redhelm, Snowbaron, Stonefist, Dreadqueen (hall HR2 / hall 1-2 stars)
+#   high: Drilltusk, Silverwind, Crystalbeard, Deadeye, Dreadking, Thunderlord, Grimclaw, Hellblade (hall 4-6 stars)
+#   G:    the six added in XX (Nightcloak, Rustrazor, Soulseer, Boltreaver, Elderfrost, Bloodbath: first quest G1)
+# The Database files every permit quest as 'G Sp' with no rank, so the low/high split comes from the quest unlock
+# conditions (game-cap.com questlist90, checked 2026-11-22). Search use: that rank and every rank above it.
+# Coin armor, told apart by the coin item id (names change with the Korean patch). Arena coins: the 14 monster coins
+# 2062-2075 and the Grandpaw coin 2815. Event (collaboration) coins: the rest.
+ARENA_COINS = set(range(2062, 2076)) | {2815}
+EVENT_COINS = {2808, 2812, 2817, 2818, 2824, 2829, 2835, 2838, 2851, 2853}
+
+DEVIANT_SEAL1 = {
+    1767: 1, 1782: 1, 1797: 1, 1812: 1,
+    1827: 2, 1842: 2, 1857: 2, 1872: 2, 1887: 2, 1902: 2, 1917: 2, 1932: 2,
+    1947: 3, 1952: 3, 1957: 3, 1962: 3, 1967: 3, 1972: 3,
+}
+
+
+def deviant_rank(item_ids):
+    """Start rank (1 low, 2 high, 3 G) of deviant armor from its recipe item ids, 0 for other armor"""
+    return min((DEVIANT_SEAL1[i] for i in item_ids if i in DEVIANT_SEAL1), default=0)
+
 
 def _names(row, prefix):
     return [row.get(f'{prefix}_{i}') or '' for i in range(9)]

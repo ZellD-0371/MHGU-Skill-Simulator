@@ -43,7 +43,6 @@ mod storage;
 mod ui;
 mod window_view;
 mod ext_block;
-mod mod_menu;
 mod picture;
 mod purplelib;
 
@@ -170,7 +169,6 @@ fn main() {
     }
     LOGGING.store(app.logging, Ordering::Relaxed);
     game_menu::install(base);
-    mod_menu::init();
     sound::install(base);
     let input_ready = input::retry(base);
     unsafe { *STATE.data.get() = Some(Plugin { app, slot: None, playing: false, input_ready, save_age: 0, prefs_dirty: false, pending: alloc::vec::Vec::new(), was_open: false, kbm: false, inv_logged: false, logged_job: 0 }) };
@@ -385,10 +383,6 @@ pub extern "C" fn forge_onUpdate(_dt: f32) {
         return;
     }
     game_menu::update();
-    // Mod menu host (Wishlist) asked to open our window: the same path as our own menu entry
-    if mod_menu::update() {
-        game_menu::OPEN_REQUEST.store(true, Ordering::Release);
-    }
     let input_ready = input::retry(base);
     let (slot, playing) = session::update();
     let overlay = forge::graphics::Graphics::is_menu_visible();
@@ -416,7 +410,6 @@ pub extern "C" fn forge_onUpdate(_dt: f32) {
         if crate::game_menu::OPEN_REQUEST.swap(false, Ordering::AcqRel) && playing && input_ready {
             p.app.open = true;
         }
-        mod_menu::set_ready(playing && input_ready && !p.app.open);
         // Inventory (equipment box, charms, equipped, items): re-read every time the window opens (it cannot change in game while the window is open)
         if p.app.open && !p.was_open && playing {
             match inventory::read(base) {
@@ -432,6 +425,19 @@ pub extern "C" fn forge_onUpdate(_dt: f32) {
                             inv.items.len()
                         );
                         p.inv_logged = true;
+                    }
+                    // Every open: compare these counts with the smithy's lists in game
+                    match &inv.smithy {
+                        Some(s) => info!(
+                            "[skill-sim] smithy list: armor {} / {}, decorations {} / {} (recipes {} / {})",
+                            s.armor.len(),
+                            p.app.db.recipe_armor_count(),
+                            s.jewels.len(),
+                            p.app.db.gd.jewels.len(),
+                            s.deco_recipes,
+                            crate::generated::unlock::DECO_KEYS.len()
+                        ),
+                        None => error!("[skill-sim] smithy list unavailable: 'smithy only' searches are refused"),
                     }
                     p.app.apply_inventory(inv);
                 }

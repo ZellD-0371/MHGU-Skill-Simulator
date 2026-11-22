@@ -18,8 +18,8 @@ pub const CHARM_ROW: usize = 5;
 pub const RES_STEPS: [Option<i8>; 6] = [None, Some(0), Some(5), Some(10), Some(15), Some(20)];
 pub const MIN_DEF: [u16; 7] = [0, 300, 400, 500, 600, 700, 800];
 pub const EXTRA_ROWS: usize = 9;
-/// Rows of the 'Armor to use' popup: low, high, G, arena, event, reward
-pub const ARMOR_USE: usize = 6;
+/// Rows of the 'Armor to use' popup: low, high, G, deviant, arena, quest reward, event
+pub const ARMOR_USE: usize = 7;
 /// Extra-skill results kept for the session
 const EXTRA_CACHE: usize = 32;
 pub const MAX_SAVED: usize = 48;
@@ -55,13 +55,14 @@ pub enum Opt {
     Kind,
     Weapon,
     Armor,
+    Smithy,
     MinDef,
     Resist,
     Priority,
     Forbid,
     Search,
 }
-pub const OPTIONS: [Opt; 8] = [Opt::Kind, Opt::Weapon, Opt::Armor, Opt::MinDef, Opt::Resist, Opt::Priority, Opt::Forbid, Opt::Search];
+pub const OPTIONS: [Opt; 9] = [Opt::Kind, Opt::Weapon, Opt::Armor, Opt::Smithy, Opt::MinDef, Opt::Resist, Opt::Priority, Opt::Forbid, Opt::Search];
 impl Opt {
     /// Number of dropdown choices (0 if not a dropdown)
     pub fn choices(self) -> usize {
@@ -106,6 +107,9 @@ pub enum Confirm {
     ReleaseAll,
     Save,
     Exclude(u16),
+    /// Exclude a decoration (from the exclude list of a part row)
+    ExcludeJewel(u16),
+    ReleaseJewel(u16),
     DeleteSaved(usize),
     ExtraAny,
     LeaveResults,
@@ -113,7 +117,7 @@ pub enum Confirm {
 impl Confirm {
     /// Is 'yes' the default cursor (others are hard to undo, so 'no')
     fn yes_default(self) -> bool {
-        matches!(self, Confirm::Save | Confirm::Exclude(_) | Confirm::ExtraAny)
+        matches!(self, Confirm::Save | Confirm::Exclude(_) | Confirm::ExcludeJewel(_) | Confirm::ExtraAny)
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +137,12 @@ pub enum Dialog {
     Diag,
     Notice,
 }
+/// An entry of the results' exclude list (X on a part row): the part's armor and the decorations placed in that part
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExItem {
+    Armor(u16),
+    Jewel(u16),
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FixItem {
     Equipped,
@@ -148,6 +158,7 @@ pub enum DiagLabel {
     Res,
     Fixed,
     Excluded,
+    Smithy,
     Lower(u16, u16),
     Remove(u16),
 }
@@ -157,11 +168,13 @@ pub struct DiagChange {
     mindef: Option<usize>,
     res: Option<[usize; RES]>,
     fixed: Option<([u16; PARTS], Option<usize>)>,
-    excluded: Option<Vec<u16>>,
+    /// Excluded armor and decorations (both released together)
+    excluded: Option<(Vec<u16>, Vec<u16>)>,
     targets: Option<Vec<u16>>,
+    smithy: Option<bool>,
 }
 impl DiagChange {
-    const NONE: DiagChange = DiagChange { forbid: None, mindef: None, res: None, fixed: None, excluded: None, targets: None };
+    const NONE: DiagChange = DiagChange { forbid: None, mindef: None, res: None, fixed: None, excluded: None, targets: None, smithy: None };
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Check {
@@ -312,6 +325,11 @@ pub struct Reuse {
     results: Vec<(skillsim_engine::search::CharmSignature, Found, Vec<skillsim_engine::types::Charm>)>,
     empty: Vec<(Cond, skillsim_engine::search::CharmSignature)>,
 }
+
+/// The smithy list's part of a search memory key: its hash with 'smithy only', 0 without (the list does not matter then)
+fn smithy_sig(db: &Db, c: &Cond) -> u64 {
+    if c.smithy { db.inv().smithy.as_ref().map_or(1, |s| s.sig) } else { 0 }
+}
 /// Built result: a search, or remembered results
 pub enum Built {
     Job(Job),
@@ -359,6 +377,8 @@ struct CachedSearch {
     cond: Cond,
     charms: Vec<skillsim_engine::types::Charm>,
     owned: alloc::collections::BTreeSet<u16>,
+    /// smithy_sig at that time (0 without 'smithy only')
+    smithy: u64,
     /// Charm signature of the owned charms at that time
     sig: Option<skillsim_engine::search::CharmSignature>,
     found: Found,
@@ -368,6 +388,9 @@ struct CachedSearch {
 struct OwnedEmpty {
     cond: Cond,
     charms: Vec<skillsim_engine::types::Charm>,
+    /// Owned armor and smithy_sig at that time: newly owned (or newly listed) armor can make a set possible
+    owned: alloc::collections::BTreeSet<u16>,
+    smithy: u64,
     sig: Option<skillsim_engine::search::CharmSignature>,
 }
 
@@ -383,6 +406,8 @@ fn at_least_as_strict(new: &Cond, old: &Cond) -> bool {
         && (!new.arena || old.arena)
         && (!new.event || old.event)
         && (!new.reward || old.reward)
+        && (!new.deviant || old.deviant)
+        && (new.smithy || !old.smithy)
         && new.min_def >= old.min_def
         && (0..RES).all(|e| match old.min_res[e] {
             None => true,
@@ -390,6 +415,7 @@ fn at_least_as_strict(new: &Cond, old: &Cond) -> bool {
         })
         && (0..PARTS).all(|p| old.fixed[p] == 0 || new.fixed[p] == old.fixed[p])
         && old.excluded.iter().all(|x| new.excluded.contains(x))
+        && old.excluded_jewels.iter().all(|x| new.excluded_jewels.contains(x))
         && new.fixed_charm.is_none()
         && old.fixed_charm.is_none()
         && new.charm_override.is_none()
@@ -502,17 +528,21 @@ pub struct App {
     pub ranks: [bool; 3],
     pub forbid: bool,
     pub priority: usize,
-    /// Search mode 'Thorough'
-    pub thorough: bool,
     pub arena: bool,
     pub event: bool,
     /// Use reward armor (no smithy recipe) even when not owned
     pub reward: bool,
+    /// Use deviant armor even when not owned (from its start rank on)
+    pub deviant: bool,
+    /// Only armor and decorations the smithy lists right now
+    pub smithy: bool,
     pub mindef: usize,
     pub res: [usize; RES],
     pub fixed: [u16; PARTS],
     pub fixed_charm: Option<usize>,
     pub excluded: Vec<u16>,
+    /// Excluded decorations (from the results' exclude list, X on a part row)
+    pub excluded_jewels: Vec<u16>,
     pub saved: Vec<Set>,
     pub recent: Vec<u16>,
     // Screen
@@ -525,6 +555,8 @@ pub struct App {
     pub menu: Option<usize>,
     pub confirm: Option<Confirm>,
     pub fixmenu: Option<(usize, usize)>,
+    /// Exclude list of the part row under the cursor is open (cursor)
+    pub exmenu: Option<usize>,
     pub fix_from: Screen,
     pub box_slot: usize,
     pub bidx: usize,
@@ -590,8 +622,8 @@ pub struct App {
     pub diag_run: Option<DiagRun>,
     pub job: Option<Job>,
     pub needed_mode: bool,
-    /// How the current results were found: (thorough, shown from memory)
-    pub results_info: (bool, bool),
+    /// The current results were shown from search memory
+    pub results_cached: bool,
     pub complete: bool,
     pub stat_nodes: u64,
     pub extra: Option<Vec<u16>>,
@@ -600,8 +632,15 @@ pub struct App {
     pub diag_out: Option<(usize, usize)>,
     pub diag_cancel: bool,
     pub extra_out: bool,
-    /// The next search continues with unowned charms without asking if owned charms find nothing (after picking a cause-analysis suggestion)
+    /// The next search continues with unowned charms without asking if owned charms find nothing: after picking a
+    /// cause-analysis suggestion or an unowned-charm extra skill, and after fixing / releasing a part or excluding armor or
+    /// a decoration on unowned-charm results (the user already chose unowned charms; a narrower condition skips the
+    /// owned-charm phase from memory, and the question only repeated that choice)
     auto_needed: bool,
+    /// Re-search from unowned-charm results (fix / release / exclude): unowned-charm results then come without the
+    /// 'searched with unowned charms' notice (nothing changed for the user). Taken by run_search into search_quiet.
+    quiet_needed: bool,
+    search_quiet: bool,
     pub extra_any: bool,
     /// Extra-skill search progress (checked, all) for the progress bar
     pub extra_prog: (u16, u16),
@@ -628,7 +667,7 @@ pub struct Snapshot {
     pub tab: usize,
     /// List pages (first row of results/saved sets, equipment box, skills, extra skills, and the detail page)
     pub page: [usize; 5],
-    overlay: (Option<(Opt, usize)>, Option<(Opt, usize)>, Option<(usize, usize)>, Option<usize>, Option<(usize, usize)>),
+    overlay: (Option<(Opt, usize)>, Option<(Opt, usize)>, Option<(usize, usize)>, Option<usize>, Option<(usize, usize)>, Option<usize>),
     confirm: Option<Confirm>,
     notice: Option<Notice>,
     pub message: u16,
@@ -665,6 +704,8 @@ pub enum Target {
     SubDrop(usize),
     Menu(usize),
     Fix(usize),
+    /// Row of the results' exclude list
+    Ex(usize),
     Manage(usize),
     Box(usize),
     Skill(usize),
@@ -691,7 +732,7 @@ impl Target {
         match self {
             Target::Page(_, l) => l,
             Target::Main(..) | Target::Manage(_) | Target::Box(_) | Target::Skill(_) | Target::Row(_) | Target::Part(_) | Target::Tab(_) | Target::Hint(_) => 0,
-            Target::Drop(_) | Target::Sub(_) | Target::Menu(_) | Target::Fix(_) | Target::Extra(_) | Target::Alt(_) | Target::ETab(_) => 1,
+            Target::Drop(_) | Target::Sub(_) | Target::Menu(_) | Target::Fix(_) | Target::Ex(_) | Target::Extra(_) | Target::Alt(_) | Target::ETab(_) => 1,
             Target::SubDrop(_) => 2,
             Target::Dialog(_) => 3,
         }
@@ -718,24 +759,24 @@ impl App {
             logging: false,
             rev: 0,
             hover: None,
-            results_info: (false, false),
+            results_cached: false,
             targets: Vec::new(),
             kind: 1,
             weapon: 0,
             ranks: [true, true, true],
             forbid: true,
             priority: 0,
-            // Always thorough: with the faster engine (2026-11-19) the fast mode no longer saves noticeable time,
-            // so the search mode choice was removed (user decision)
-            thorough: true,
             arena: false,
             event: false,
             reward: false,
+            deviant: false,
+            smithy: false,
             mindef: 0,
             res: [0; RES],
             fixed: [0; PARTS],
             fixed_charm: None,
             excluded: Vec::new(),
+            excluded_jewels: Vec::new(),
             saved: Vec::new(),
             recent: Vec::new(),
             screen: Screen::Main,
@@ -747,6 +788,7 @@ impl App {
             menu: None,
             confirm: None,
             fixmenu: None,
+            exmenu: None,
             fix_from: Screen::Main,
             box_slot: 0,
             bidx: 0,
@@ -801,6 +843,8 @@ impl App {
             diag_cancel: false,
             extra_out: false,
             auto_needed: false,
+            quiet_needed: false,
+            search_quiet: false,
             extra_any: false,
             extra_prog: (0, 0),
             extra_cancel: false,
@@ -866,14 +910,16 @@ impl App {
             arena: self.arena,
             event: self.event,
             reward: self.reward,
+            deviant: self.deviant,
+            smithy: self.smithy,
             sex: if self.db.inv().sex == 2 { 2 } else { 1 },
             min_def: MIN_DEF[mindef],
             min_res: core::array::from_fn(|e| RES_STEPS[res[e]]),
             fixed,
             fixed_charm,
             excluded: excluded.to_vec(),
+            excluded_jewels: self.excluded_jewels.clone(),
             charm_override: None,
-            thorough: self.thorough,
         }
     }
 
@@ -1077,6 +1123,11 @@ impl App {
             Target::Fix(i) => {
                 if let Some((s, _)) = self.fixmenu {
                     self.fixmenu = Some((s, i));
+                }
+            }
+            Target::Ex(i) => {
+                if self.exmenu.is_some() {
+                    self.exmenu = Some(i);
                 }
             }
             Target::Manage(r) => self.midx = r,
@@ -1372,8 +1423,9 @@ impl App {
             self.fixed = f;
             self.fixed_charm = c;
         }
-        if let Some(v) = &ch.excluded {
-            self.excluded = v.clone();
+        if let Some((armor, jewels)) = &ch.excluded {
+            self.excluded = armor.clone();
+            self.excluded_jewels = jewels.clone();
         }
         if let Some(v) = &ch.targets {
             self.targets = v.clone();
@@ -1394,10 +1446,15 @@ impl App {
             }
             Confirm::Release(id) => {
                 self.excluded.retain(|&x| x != id);
-                self.midx = self.midx.min(self.excluded.len().saturating_sub(1));
+                self.midx = self.midx.min((self.excluded.len() + self.excluded_jewels.len()).saturating_sub(1));
+            }
+            Confirm::ReleaseJewel(id) => {
+                self.excluded_jewels.retain(|&x| x != id);
+                self.midx = self.midx.min((self.excluded.len() + self.excluded_jewels.len()).saturating_sub(1));
             }
             Confirm::ReleaseAll => {
                 self.excluded.clear();
+                self.excluded_jewels.clear();
                 self.midx = 0;
             }
             Confirm::Save => {
@@ -1412,6 +1469,16 @@ impl App {
             Confirm::Exclude(id) => {
                 self.excluded.push(id);
                 self.persist();
+                self.research_from_results();
+                self.run_search();
+                return;
+            }
+            Confirm::ExcludeJewel(id) => {
+                if !self.excluded_jewels.contains(&id) {
+                    self.excluded_jewels.push(id);
+                }
+                self.persist();
+                self.research_from_results();
                 self.run_search();
                 return;
             }
@@ -1509,6 +1576,10 @@ impl App {
                     _ => {}
                 },
             }
+            return;
+        }
+        if self.exmenu.is_some() {
+            self.on_exmenu(b);
             return;
         }
         if self.fixmenu.is_some() {
@@ -1615,7 +1686,7 @@ impl App {
             // Skill picker tab and extra-skill tab together (either change plays the tab sound)
             tab: self.tab * 64 + self.etab,
             page: [self.rtop, self.btop, self.stop, self.etop, self.dpage],
-            overlay: (self.drop, self.sub, self.subdrop, self.menu, self.fixmenu),
+            overlay: (self.drop, self.sub, self.subdrop, self.menu, self.fixmenu, self.exmenu),
             confirm: self.confirm,
             notice: self.notice,
             message: self.message,
@@ -1645,7 +1716,7 @@ impl App {
     }
 
     fn own_hints(&mut self) -> Vec<(Button, u16)> {
-        if self.fixmenu.is_some() {
+        if self.fixmenu.is_some() || self.exmenu.is_some() {
             return alloc::vec![(A, k::H_OK), (B, k::H_CLOSE)];
         }
         match self.screen {
@@ -1688,7 +1759,7 @@ impl App {
             Screen::Skills => alloc::vec![(A, k::H_TOGGLE), (B, k::H_RETURN)],
             Screen::Manage => {
                 let mut out = Vec::new();
-                if !self.excluded.is_empty() {
+                if !self.manage_items().is_empty() {
                     out.push((X, k::H_RELEASE));
                     out.push((Y, k::H_RELEASE_ALL));
                 }
@@ -1745,7 +1816,7 @@ impl App {
                     out.push((A, k::H_ALTS));
                 }
                 if self.screen == Screen::Results {
-                    if self.pidx < PARTS {
+                    if !self.exclude_items().is_empty() {
                         out.push((X, k::H_EXCLUDE));
                     }
                     if self.pidx < PARTS || (self.pidx == CHARM_ROW && cur.is_some_and(|c| c.charm >= 0)) {
@@ -1759,14 +1830,26 @@ impl App {
     }
 
     // ---- Search ----
+    /// A re-search from the results screen (fix / release / exclude). On unowned-charm results the user already chose
+    /// unowned charms: owned charms first, then unowned without asking again (auto_needed), and no notice (quiet_needed)
+    fn research_from_results(&mut self) {
+        self.auto_needed = self.needed_mode;
+        self.quiet_needed = self.needed_mode;
+    }
+
     pub fn run_search(&mut self) {
         let ask_needed = !core::mem::take(&mut self.auto_needed);
+        self.search_quiet = core::mem::take(&mut self.quiet_needed);
         if self.targets.is_empty() {
             self.message = k::MSG_NO_TARGET;
             return;
         }
         if !self.ranks.iter().any(|&r| r) {
             self.message = k::MSG_NO_RANK;
+            return;
+        }
+        if self.smithy && self.db.inv().smithy.is_none() {
+            self.message = k::MSG_SMITHY_UNREAD;
             return;
         }
         for &id in self.targets.iter().rev() {
@@ -1781,7 +1864,8 @@ impl App {
         // Reuse 0: if complete results exist for exactly the same conditions and owned equipment, show them at once
         // (including results that went on to unowned charms)
         let inv = self.db.inv();
-        if let Some(e) = self.result_cache.iter().find(|e| e.cond == c && e.charms == inv.charms && e.owned == inv.owned) {
+        let sig = smithy_sig(self.db, &c);
+        if let Some(e) = self.result_cache.iter().find(|e| e.cond == c && e.charms == inv.charms && e.owned == inv.owned && e.smithy == sig) {
             let mut found = e.found.clone();
             let old = e.charms.clone();
             self.remap_charms(&mut found, &old);
@@ -1794,7 +1878,8 @@ impl App {
         }
         // Reuse 1: if as strict as or stricter than a remembered 'nothing with owned charms' condition, skip the owned-charm phase
         let inv = self.db.inv();
-        let known_empty = self.owned_empty.iter().any(|m| m.charms == inv.charms && at_least_as_strict(&c, &m.cond));
+        let known_empty =
+            self.owned_empty.iter().any(|m| m.charms == inv.charms && m.owned == inv.owned && m.smithy == sig && at_least_as_strict(&c, &m.cond));
         // Reuse 2: re-check earlier (owned-charm) results under the current conditions and start with them in the results
         let seeds = if self.needed_mode { Vec::new() } else { self.results.iter().take(200).cloned().collect() };
         // Reuse 3: even if the owned charm list differs, use 0 and 1 when the charm signature matches (compared outside the lock after building)
@@ -1802,10 +1887,15 @@ impl App {
             results: self
                 .result_cache
                 .iter()
-                .filter(|e| e.cond == c && e.owned == inv.owned)
+                .filter(|e| e.cond == c && e.owned == inv.owned && e.smithy == sig)
                 .filter_map(|e| e.sig.clone().map(|s| (s, e.found.clone(), e.charms.clone())))
                 .collect(),
-            empty: self.owned_empty.iter().filter_map(|m| m.sig.clone().map(|s| (m.cond.clone(), s))).collect(),
+            empty: self
+                .owned_empty
+                .iter()
+                .filter(|m| m.owned == inv.owned && m.smithy == sig)
+                .filter_map(|m| m.sig.clone().map(|s| (m.cond.clone(), s)))
+                .collect(),
         };
         self.search_cond = Some((c.clone(), known_empty));
         let o = Opts { owned_empty: known_empty, ask_needed, ..Opts::MAIN };
@@ -1905,8 +1995,10 @@ impl App {
                 // The owned-charm phase finished with no results: remember this condition (stricter conditions skip it next time)
                 if let Some((c, _)) = self.search_cond.clone() {
                     let charms = self.db.inv().charms.clone();
-                    self.owned_empty.retain(|m| !(m.charms == charms && at_least_as_strict(&m.cond, &c)));
-                    self.owned_empty.insert(0, OwnedEmpty { cond: c, charms, sig: job.charm_sig.clone() });
+                    let owned = self.db.inv().owned.clone();
+                    let smithy = smithy_sig(self.db, &c);
+                    self.owned_empty.retain(|m| !(m.charms == charms && m.owned == owned && m.smithy == smithy && at_least_as_strict(&m.cond, &c)));
+                    self.owned_empty.insert(0, OwnedEmpty { cond: c, charms, owned, smithy, sig: job.charm_sig.clone() });
                     self.owned_empty.truncate(8);
                 }
             }
@@ -1919,8 +2011,9 @@ impl App {
                 if job.complete {
                     if let Some((c, _)) = self.search_cond.clone() {
                         let inv = self.db.inv();
-                        let entry = CachedSearch { cond: c, charms: inv.charms.clone(), owned: inv.owned.clone(), sig: job.charm_sig.clone(), found: found.clone() };
-                        self.result_cache.retain(|e| !(e.cond == entry.cond && e.charms == entry.charms && e.owned == entry.owned));
+                        let smithy = smithy_sig(self.db, &c);
+                        let entry = CachedSearch { cond: c, charms: inv.charms.clone(), owned: inv.owned.clone(), smithy, sig: job.charm_sig.clone(), found: found.clone() };
+                        self.result_cache.retain(|e| !(e.cond == entry.cond && e.charms == entry.charms && e.owned == entry.owned && e.smithy == entry.smithy));
                         self.result_cache.insert(0, entry);
                         self.result_cache.truncate(4);
                     }
@@ -1933,7 +2026,7 @@ impl App {
 
     fn finish_search(&mut self, found: Found) {
         self.touch();
-        self.results_info = (self.search_cond.as_ref().map_or(self.thorough, |(c, _)| c.thorough), self.cache_hit);
+        self.results_cached = self.cache_hit;
         self.results = found.sets;
         self.needed_mode = found.needed;
         self.complete = found.complete;
@@ -1954,7 +2047,7 @@ impl App {
                 self.start_diag();
             }
         } else {
-            self.notice = if self.needed_mode { Some(Notice::Needed) } else { None };
+            self.notice = if self.needed_mode && !self.search_quiet { Some(Notice::Needed) } else { None };
         }
         self.persist();
     }
@@ -1967,12 +2060,12 @@ impl App {
         }
         let top_free = best.iter().map(|r| r.free).max().unwrap_or(0);
         let top_def = best.iter().map(|r| r.def).max().unwrap_or(0);
-        let jewel_rank = self.ranks.iter().rposition(|&on| on).map_or(3, |i| i as u8 + 1);
+        let jewels = self.db.jewel_use(&self.ranks, self.smithy, &self.excluded_jewels);
         for r in best.iter_mut() {
             let c = r.craft(self.db);
             // 'Most free slots' only if the free slots can activate something more: otherwise the set is just worse
             // (more parts to craft or lower defense for slots that hold nothing useful)
-            let slots = r.free == top_free && r.free > 0 && r.free_slots_useful(self.db, jewel_rank);
+            let slots = r.free == top_free && r.free > 0 && r.free_slots_useful(self.db, &jewels);
             r.tags = (c == 0) as u8 | (slots as u8) << 1 | ((r.def == top_def) as u8) << 2;
         }
         // Only sets with a reason stay in the recommended block; the others go first in the rest
@@ -2002,8 +2095,12 @@ impl App {
         if self.fixed.iter().any(|&f| f != 0) || self.fixed_charm.is_some() {
             cands.push((DiagLabel::Fixed, DiagChange { fixed: Some(([0; PARTS], None)), ..DiagChange::NONE }));
         }
-        if !self.excluded.is_empty() {
-            cands.push((DiagLabel::Excluded, DiagChange { excluded: Some(Vec::new()), ..DiagChange::NONE }));
+        if !self.excluded.is_empty() || !self.excluded_jewels.is_empty() {
+            cands.push((DiagLabel::Excluded, DiagChange { excluded: Some((Vec::new(), Vec::new())), ..DiagChange::NONE }));
+        }
+        // The smithy filter hides armor and decorations without a trace: worth naming when it is the cause
+        if self.smithy {
+            cands.push((DiagLabel::Smithy, DiagChange { smithy: Some(false), ..DiagChange::NONE }));
         }
         for (i, &id) in self.targets.iter().enumerate() {
             let Some(s) = self.db.skill(id) else { continue };
@@ -2035,8 +2132,11 @@ impl App {
     fn diag_cond(&self, ch: &DiagChange) -> Cond {
         let targets = ch.targets.clone().unwrap_or_else(|| self.targets.clone());
         let (fixed, fixed_charm) = ch.fixed.unwrap_or((self.fixed, self.fixed_charm));
-        let excluded = ch.excluded.clone().unwrap_or_else(|| self.excluded.clone());
-        self.cond_with(&targets, ch.forbid.unwrap_or(self.forbid), ch.mindef.unwrap_or(self.mindef), ch.res.unwrap_or(self.res), fixed, fixed_charm, &excluded)
+        let (excluded, jewels) = ch.excluded.clone().unwrap_or_else(|| (self.excluded.clone(), self.excluded_jewels.clone()));
+        let mut c = self.cond_with(&targets, ch.forbid.unwrap_or(self.forbid), ch.mindef.unwrap_or(self.mindef), ch.res.unwrap_or(self.res), fixed, fixed_charm, &excluded);
+        c.excluded_jewels = jewels;
+        c.smithy = ch.smithy.unwrap_or(self.smithy);
+        c
     }
 
     /// PC tests (inline_build): no lock, so do it right here
@@ -2206,8 +2306,9 @@ impl App {
         c.min_res = [None; RES];
         c.charm_override = if any_charm { None } else { Some(cur.charm_data(self.db).unwrap_or(Charm { skills: [Pt::default(); 2], slots: 0 })) };
         // Same set and conditions as an earlier check in this session: show that result at once.
-        // The result depends only on these (fixed armor, charm, weapon slots, targets, ranks): not on the owned items.
-        let key = alloc::format!("{}|{:?}|{}", c.encode(), c.charm_override, any_charm);
+        // The result depends only on these (fixed armor, charm, weapon slots, targets, ranks, the smithy's decoration list
+        // with 'smithy only'): not on the owned items.
+        let key = alloc::format!("{}|{:?}|{}|{}", c.encode(), c.charm_override, any_charm, smithy_sig(self.db, &c));
         if let Some(end) = self.extra_cache.iter().find(|(k, _)| *k == key).map(|(_, end)| end.clone()) {
             self.extra_any = any_charm;
             self.extra_summary = None;
@@ -2341,10 +2442,10 @@ fn point_bound(db: &Db, c: &Cond, any_charm: bool, tree: u16) -> i32 {
     }
     let torso_up = (0..PARTS).filter(|&p| p != TORSO && armor[p].is_some_and(|a| a.skills.iter().any(|s| s.tree == TREE_TORSO_UP && s.pt > 0))).count() as i32;
     // Best points in a container of n slots (n = 0..3) with decorations of this tree (unbounded knapsack)
-    let jewel_rank = c.ranks.iter().rposition(|&on| on).map_or(3, |i| i as u8 + 1);
+    let jewels = db.jewel_use(&c.ranks, c.smithy, &c.excluded_jewels);
     let mut best = [0i32; 4];
     for n in 1..4 {
-        for j in db.gd.jewels.iter().filter(|j| j.pos.tree == tree && j.pos.pt > 0 && j.rank <= jewel_rank) {
+        for j in db.gd.jewels.iter().filter(|j| j.pos.tree == tree && j.pos.pt > 0 && jewels.allows(j)) {
             if (j.size as usize) <= n {
                 best[n] = best[n].max(best[n - j.size as usize] + j.pos.pt as i32);
             }
@@ -2442,6 +2543,42 @@ impl App {
         v
     }
 
+    /// Exclude list of the part row under the cursor (results screen): its armor (armor rows), then the decorations
+    /// placed in it (each once)
+    pub fn exclude_items(&self) -> Vec<ExItem> {
+        let Some(cur) = self.current() else { return Vec::new() };
+        let mut out = Vec::new();
+        if self.pidx < PARTS {
+            out.push(ExItem::Armor(cur.head(self.pidx)));
+        }
+        let container = if self.pidx < PARTS { self.pidx } else if self.pidx == CHARM_ROW { crate::set::CHARM } else { crate::set::WEAPON };
+        let (placed, _) = cur.placement(self.db);
+        for &j in &placed[container] {
+            if !out.contains(&ExItem::Jewel(j)) {
+                out.push(ExItem::Jewel(j));
+            }
+        }
+        out
+    }
+
+    fn on_exmenu(&mut self, b: Button) {
+        let idx = self.exmenu.unwrap_or(0);
+        let items = self.exclude_items();
+        match b {
+            Up | Down if !items.is_empty() => self.exmenu = Some(step(idx, items.len(), b)),
+            B => self.exmenu = None,
+            A => {
+                self.exmenu = None;
+                match items.get(idx) {
+                    Some(ExItem::Armor(id)) => self.ask(Confirm::Exclude(*id)),
+                    Some(ExItem::Jewel(id)) => self.ask(Confirm::ExcludeJewel(*id)),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_fixmenu(&mut self, slot: usize) {
         self.fixmenu = Some((slot, 0));
         self.fix_from = self.screen;
@@ -2457,6 +2594,7 @@ impl App {
         }
         self.persist();
         if self.fix_from == Screen::Results {
+            self.research_from_results();
             self.run_search();
         } else {
             self.screen = Screen::Main;
@@ -2529,9 +2667,10 @@ impl App {
     pub fn armor_use(&self, i: usize) -> bool {
         match i {
             0..=2 => self.ranks[i],
-            3 => self.arena,
-            4 => self.event,
-            _ => self.reward,
+            3 => self.deviant,
+            4 => self.arena,
+            5 => self.reward,
+            _ => self.event,
         }
     }
 
@@ -2569,9 +2708,10 @@ impl App {
                 A => {
                     match idx {
                         0..=2 => self.ranks[idx] = !self.ranks[idx],
-                        3 => self.arena = !self.arena,
-                        4 => self.event = !self.event,
-                        _ => self.reward = !self.reward,
+                        3 => self.deviant = !self.deviant,
+                        4 => self.arena = !self.arena,
+                        5 => self.reward = !self.reward,
+                        _ => self.event = !self.event,
                     }
                     self.persist();
                 }
@@ -2668,6 +2808,11 @@ impl App {
                     self.sub = Some((opt, 0));
                 } else if opt == Opt::Forbid {
                     self.forbid = !self.forbid;
+                } else if opt == Opt::Smithy {
+                    self.smithy = !self.smithy;
+                    if self.smithy && self.db.inv().smithy.is_none() {
+                        self.message = k::MSG_SMITHY_UNREAD;
+                    }
                 } else if opt == Opt::Search {
                     self.run_search();
                 }
@@ -2678,12 +2823,21 @@ impl App {
     }
 
     // ---- Excluded armor ----
+    /// Rows of the excluded gear screen: armor first, then decorations
+    pub fn manage_items(&self) -> Vec<ExItem> {
+        self.excluded.iter().map(|&a| ExItem::Armor(a)).chain(self.excluded_jewels.iter().map(|&j| ExItem::Jewel(j))).collect()
+    }
+
     fn on_manage(&mut self, b: Button) {
-        let n = self.excluded.len();
+        let items = self.manage_items();
+        let n = items.len();
         match b {
             Up | Down if n > 0 => self.midx = step(self.midx, n, b),
             B => self.screen = Screen::Main,
-            X if n > 0 => self.ask(Confirm::Release(self.excluded[self.midx])),
+            X if n > 0 => match items[self.midx.min(n - 1)] {
+                ExItem::Armor(id) => self.ask(Confirm::Release(id)),
+                ExItem::Jewel(id) => self.ask(Confirm::ReleaseJewel(id)),
+            },
             Y if n > 0 => self.ask(Confirm::ReleaseAll),
             _ => {}
         }
@@ -2946,7 +3100,12 @@ impl App {
                 None => self.alt_popup_wait = Some(self.pidx),
             },
             _ if self.screen != Screen::Results => {}
-            X if self.pidx < PARTS => self.ask(Confirm::Exclude(cur.head(self.pidx))),
+            X => match self.exclude_items().as_slice() {
+                [] => {}
+                // Only the armor (no decorations in this part): straight to the question, as before
+                [ExItem::Armor(id)] => self.ask(Confirm::Exclude(*id)),
+                _ => self.exmenu = Some(0),
+            },
             Y if self.pidx < PARTS || (self.pidx == CHARM_ROW && cur.charm >= 0) => {
                 if self.is_fixed(self.pidx) {
                     self.open_fixmenu(self.pidx);
@@ -2972,15 +3131,17 @@ impl App {
         let _ = writeln!(s, "ranks={},{},{}", self.ranks[0] as u8, self.ranks[1] as u8, self.ranks[2] as u8);
         let _ = writeln!(s, "forbid={}", self.forbid as u8);
         let _ = writeln!(s, "priority={}", self.priority);
-        let _ = writeln!(s, "thorough={}", self.thorough as u8);
         let _ = writeln!(s, "arena={}", self.arena as u8);
         let _ = writeln!(s, "event={}", self.event as u8);
         let _ = writeln!(s, "reward={}", self.reward as u8);
+        let _ = writeln!(s, "deviant={}", self.deviant as u8);
+        let _ = writeln!(s, "smithy={}", self.smithy as u8);
         let _ = writeln!(s, "mindef={}", self.mindef);
         let _ = writeln!(s, "res={}", self.res.iter().map(|x| alloc::format!("{}", x)).collect::<Vec<_>>().join(","));
         let _ = writeln!(s, "fixed={}", list(&self.fixed));
         let _ = writeln!(s, "fixed_charm={}", self.fixed_charm.map_or(-1, |c| c as i32));
         let _ = writeln!(s, "excluded={}", list(&self.excluded));
+        let _ = writeln!(s, "excluded_jewels={}", list(&self.excluded_jewels));
         let _ = writeln!(s, "recent={}", list(&self.recent));
         for set in &self.saved {
             let _ = writeln!(s, "saved={}", set.encode(self.db));
@@ -2992,6 +3153,10 @@ impl App {
         self.touch();
         let nums = |v: &str| v.split(',').filter_map(|x| x.parse::<u16>().ok()).collect::<Vec<u16>>();
         self.saved.clear();
+        // Keys newer than some saves: start from the default so another character's value does not carry over
+        self.excluded_jewels.clear();
+        self.deviant = false;
+        self.smithy = false;
         for line in text.lines() {
             let Some((key, v)) = line.split_once('=') else { continue };
             match key {
@@ -3007,10 +3172,12 @@ impl App {
                 "forbid" => self.forbid = v == "1",
                 // 1 (defense priority) no longer exists: falls back to free slots
                 "priority" => self.priority = if v == "2" { 2 } else { 0 },
-                "thorough" => {} // always thorough now (older saves may say 0)
+                "thorough" => {} // older saves: the search mode choice was removed (always thorough)
                 "arena" => self.arena = v == "1",
                 "event" => self.event = v == "1",
                 "reward" => self.reward = v == "1",
+                "deviant" => self.deviant = v == "1",
+                "smithy" => self.smithy = v == "1",
                 "mindef" => self.mindef = v.parse().unwrap_or(0).min(MIN_DEF.len() - 1),
                 "res" => {
                     let r = nums(v);
@@ -3026,6 +3193,7 @@ impl App {
                 }
                 "fixed_charm" => self.fixed_charm = v.parse::<i32>().ok().filter(|&c| c >= 0).map(|c| c as usize),
                 "excluded" => self.excluded = nums(v),
+                "excluded_jewels" => self.excluded_jewels = nums(v),
                 "recent" => self.recent = nums(v).into_iter().filter(|&id| self.db.skill(id).is_some()).collect(),
                 "saved" => {
                     if let Some(mut set) = Set::decode(v) {

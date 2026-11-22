@@ -3,3 +3,4 @@ pub mod armor_map;
 pub mod atlas;
 pub mod data;
 pub mod strings;
+pub mod unlock;

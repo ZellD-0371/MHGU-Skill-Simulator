@@ -13,6 +13,15 @@ use alloc::vec::Vec;
 pub const MAXT: usize = 8;
 /// Fixed-point scale of the slot-equivalent bound (LCM of 1..10: keeps decoration size/point ratios integral)
 const VAL_SCALE: u32 = 2520;
+
+/// Resistance and defense in the slot-equivalent bounds (cond_value): value of one missing resistance point, x VAL_SCALE
+/// per slot. The bound holds for any weight; each is tried and the tightest is used (measured best range, 2026-11-22).
+const RES_LAMS: [i64; 7] = [VAL_SCALE as i64 / 4, VAL_SCALE as i64 / 2, VAL_SCALE as i64, 2 * VAL_SCALE as i64, 4 * VAL_SCALE as i64, 8 * VAL_SCALE as i64, 16 * VAL_SCALE as i64];
+/// A defense point's weight = the resistance weight / one of these (each paired with each resistance weight)
+const DEF_DIVS: [i64; 3] = [4, 16, 64];
+/// Dimensions of that bound: the five elements and defense (bit RES)
+const COND_DIMS: usize = RES + 1;
+const NEG_VAL: i64 = i64::MIN / 4;
 pub const MAXJ: usize = 24;
 pub const LEVELS: usize = 6;
 /// Internal priority of the needed-charm mode: easiest charm first.
@@ -33,6 +42,7 @@ pub struct Target {
     pub need: i16,
 }
 
+#[derive(Clone, Copy)]
 pub struct Query<'a> {
     pub targets: &'a [Target],
     /// 1 blademaster, 2 gunner
@@ -46,6 +56,8 @@ pub struct Query<'a> {
     pub exclude_flags: u8,
     /// Only decorations craftable at or below this rank (1 low, 2 high, 3 G).
     pub jewel_rank: u8,
+    /// If given, only these decorations (ids, sorted) on top of jewel_rank: the ones the smithy lists right now.
+    pub jewel_ids: Option<&'a [u16]>,
     /// Result priority: 0 free slots, 1 defense, 2 lowest rarity (sets whose highest-rarity part to craft is lowest first,
     /// ties by free slots -> parts to craft -> defense).
     /// Anything but 0 cannot use free-slot pruning and is slower.
@@ -297,6 +309,28 @@ pub struct Searcher<'a> {
     pub group_counts: [(u16, u16); LEVELS],
     min_res: [Option<i8>; RES],
     suf_res: [[i16; RES]; LEVELS + 1],
+    /// A resistance or defense condition is set (quick_short in the search loop)
+    quick: bool,
+    /// Resistance conditions: armor groups split by resistance (the key holds it), so with conditions on many elements a
+    /// level had ~70 groups instead of ~11 and the skill bounds repeated the same work for every resistance variant
+    /// (five elements: 14-30M nodes, 2026-11-22). The search then walks coarse groups (same key without resistance; the
+    /// key's resistance is the per-element max, the defense the max) and, once a whole set is chosen, expands each part
+    /// into its resistance groups (expand). Bounds on a coarse group are at least as loose as on any of its groups, so no
+    /// set is lost. Empty when there is no resistance condition (the search walks `groups`).
+    coarse: [Vec<Group>; PARTS],
+    /// Resistance groups (indices into `groups[l]`) of each coarse group: coarse[l][c].first / len index this list
+    coarse_fine: [Vec<u16>; PARTS],
+    /// Resistance / defense conditions in the slot-equivalent bounds (cond_value). The weight pairs (resistance, defense),
+    /// and per subset of the conditioned dimensions (bit e = element e, bit RES = defense) its index among them (255 = not
+    /// a subset). Index of the tables = weight pair * cond_n + subset index. Per level the max of 'value + weights x the
+    /// subset's resistance and defense' over non-torso-up groups, and the max of 'weights x ...' over torso-up groups
+    /// (their value depends on the torso: rebuild_suffix). Empty without conditions.
+    cond_w: Vec<(i64, i64)>,
+    cond_idx: [u8; 1 << COND_DIMS],
+    cond_n: usize,
+    lvl_valr: Vec<[i64; LEVELS]>,
+    lvl_tupr: Vec<[i64; LEVELS]>,
+    suf_valr: Vec<[i64; LEVELS + 1]>,
     /// Split work (parallel search): searchers with the same conditions take torso candidates one at a time from this ticket counter.
     /// Without it, one searcher goes through all of them in order.
     root: Option<&'a core::sync::atomic::AtomicU32>,
@@ -385,7 +419,8 @@ impl<'a> Searcher<'a> {
         }
 
         crate::trace::mark(2);
-        let mut js: Vec<Jewel> = jewels.iter().filter(|j| j.rank <= q.jewel_rank).copied().collect();
+        let mut js: Vec<Jewel> =
+            jewels.iter().filter(|j| j.rank <= q.jewel_rank && q.jewel_ids.is_none_or(|ids| ids.binary_search(&j.id).is_ok())).copied().collect();
         js.sort_by(|a, b| (a.pos.tree, b.size, a).cmp(&(b.pos.tree, a.size, b)));
         js.dedup_by(|a, b| (a.size, a.pos, a.neg) == (b.size, b.pos, b.neg));
         if js.iter().any(|j| {
@@ -424,7 +459,10 @@ impl<'a> Searcher<'a> {
             }
         }
         let key_of = |skills: &[Pt], slots: u8, tup: bool, res: &[i8; RES], own: bool, rare: u8| -> Key {
-            let rare = if q.priority == 2 && !own { rare } else { 0 };
+            // Rarity splits groups only where it ranks results: the owned-charm search with rarity priority. The unowned-charm
+            // search ranks by chance, then free slots (rarity unused), and splitting there only made it bigger: with a minimum
+            // defense, 44.6M nodes instead of 71k for the same 30 sets (2026-11-22, over 2 minutes on Recomp).
+            let rare = if q.priority == 2 && q.charm_kinds.is_none() && !own { rare } else { 0 };
             let mut k =
                 Key { own, rare, tup, proj: [0; MAXT], slots, sec: 0, tal: 0, sig: [Pt::default(); 4], res: [0; RES] };
             for e in 0..RES {
@@ -589,6 +627,31 @@ impl<'a> Searcher<'a> {
                 suf_res[l][e] = suf_res[l + 1][e] + best;
             }
         }
+        let mut coarse: [Vec<Group>; PARTS] = Default::default();
+        let mut coarse_fine: [Vec<u16>; PARTS] = Default::default();
+        if q.min_res.iter().any(|m| m.is_some()) {
+            for l in 0..PARTS {
+                // Coarse groups in the order of their first resistance group (the search order of the level)
+                let mut lists: Vec<(Key, u16, [i8; RES], Vec<u16>)> = Vec::new();
+                for (gi, g) in groups[l].iter().enumerate() {
+                    let k = Key { res: [0; RES], ..g.key };
+                    match lists.iter_mut().find(|x| x.0 == k) {
+                        Some(x) => {
+                            x.1 = x.1.max(g.def);
+                            for e in 0..RES {
+                                x.2[e] = x.2[e].max(g.key.res[e]);
+                            }
+                            x.3.push(gi as u16);
+                        }
+                        None => lists.push((k, g.def, g.key.res, alloc::vec![gi as u16])),
+                    }
+                }
+                for (k, def, res, fine) in lists {
+                    coarse[l].push(Group { key: Key { res, ..k }, first: coarse_fine[l].len() as u32, len: fine.len() as u32, def });
+                    coarse_fine[l].extend(fine);
+                }
+            }
+        }
         let mut suf_def = [0u16; LEVELS + 1];
         for l in (0..LEVELS).rev() {
             suf_def[l] = suf_def[l + 1] + groups[l].iter().map(|g| g.def).max().unwrap_or(0);
@@ -685,6 +748,75 @@ impl<'a> Searcher<'a> {
             }
             lvl_val[CHARM_LEVEL] = charm_val[tal_possible as usize];
         }
+        // Resistance and defense in the slot-equivalent bounds: a set must cover the missing target value with slots and
+        // part values and also reach each resistance and the defense; adding 'weight x missing amount' to both sides keeps
+        // it a valid bound, and a part gives its value, resistance and defense together. Groups beaten in skills but kept
+        // for their resistance or defense then no longer count with the best of everything at once (2026-11-22: resistance
+        // grid 580M -> 226M nodes, minimum defense grid 384M -> 180M).
+        let mut cond_mask = 0usize;
+        for e in 0..RES {
+            if q.min_res[e].is_some() {
+                cond_mask |= 1 << e;
+            }
+        }
+        if q.min_def > 0 {
+            cond_mask |= 1 << RES;
+        }
+        let (mut cond_w, mut cond_idx, mut cond_n) = (Vec::new(), [255u8; 1 << COND_DIMS], 0usize);
+        let (mut lvl_valr, mut lvl_tupr) = (Vec::new(), Vec::new());
+        if cond_mask != 0 {
+            let subsets: Vec<usize> = (0..1usize << COND_DIMS).filter(|&x| x & !cond_mask == 0).collect();
+            for (k, &x) in subsets.iter().enumerate() {
+                cond_idx[x] = k as u8;
+            }
+            cond_n = subsets.len();
+            for &lam in &RES_LAMS {
+                if cond_mask >> RES & 1 == 1 {
+                    cond_w.extend(DEF_DIVS.iter().map(|&dv| (lam, lam / dv)));
+                } else {
+                    cond_w.push((lam, 0));
+                }
+            }
+            // Per group: value (None for torso-up), resistance, defense
+            // (an item no better than another in value, every resistance and defense is never a max: left out)
+            let items: [Vec<(Option<i64>, [i8; RES], i64)>; PARTS] = core::array::from_fn(|l| {
+                let all: Vec<(Option<i64>, [i8; RES], i64)> =
+                    groups[l].iter().map(|g| ((!g.key.tup).then(|| value(&g.key, 1) as i64), g.key.res, g.def as i64)).collect();
+                let le = |a: &(Option<i64>, [i8; RES], i64), b: &(Option<i64>, [i8; RES], i64)| {
+                    a.0.is_some() == b.0.is_some() && a.0 <= b.0 && a.2 <= b.2 && (0..RES).all(|e| a.1[e] <= b.1[e])
+                };
+                (0..all.len())
+                    .filter(|&i| !(0..all.len()).any(|j| j != i && le(&all[i], &all[j]) && (!le(&all[j], &all[i]) || j < i)))
+                    .map(|i| all[i])
+                    .collect()
+            });
+            let nw = cond_w.len();
+            lvl_valr = alloc::vec![[NEG_VAL; LEVELS]; nw * cond_n];
+            lvl_tupr = alloc::vec![[NEG_VAL; LEVELS]; nw * cond_n];
+            for (k, &x) in subsets.iter().enumerate() {
+                let with_def = x >> RES & 1 == 1;
+                for l in 0..PARTS {
+                    for (val, res, def) in &items[l] {
+                        // The subset's resistance once per group, then each weight pair
+                        let r: i64 = (0..RES).filter(|&e| x >> e & 1 == 1).map(|e| res[e] as i64).sum();
+                        let dd = if with_def { *def } else { 0 };
+                        for (w, &(wr, wd)) in cond_w.iter().enumerate() {
+                            let c = wr * r + wd * dd;
+                            let at = w * cond_n + k;
+                            match val {
+                                Some(val) => lvl_valr[at][l] = lvl_valr[at][l].max(val + c),
+                                None => lvl_tupr[at][l] = lvl_tupr[at][l].max(c),
+                            }
+                        }
+                    }
+                }
+            }
+            // Charms have no resistance or defense
+            for v in lvl_valr.iter_mut() {
+                v[CHARM_LEVEL] = lvl_val[CHARM_LEVEL] as i64;
+            }
+        }
+        let suf_valr = alloc::vec![[0i64; LEVELS + 1]; lvl_valr.len()];
         // Chance bound table (needed-charm mode): for every possible charm, its 'slots + target points' value and the chance to get it or better.
         // Kept in value order with the max chance accumulated from the end -> 'chance of the easiest charm with value V or more'.
         // After the results fill up, a branch is cut when its needed charm value is so high that no charm beats the worst result's chance (chance_short).
@@ -745,6 +877,15 @@ impl<'a> Searcher<'a> {
             group_counts,
             min_res: q.min_res,
             suf_res,
+            quick: q.min_def > 0 || q.min_res.iter().any(|m| m.is_some()),
+            coarse,
+            coarse_fine,
+            cond_w,
+            cond_idx,
+            cond_n,
+            lvl_valr,
+            lvl_tupr,
+            suf_valr,
             root: None,
             seeded: Default::default(),
             tal_mono,
@@ -811,7 +952,7 @@ impl<'a> Searcher<'a> {
         }
         let (mut p, mut w) = (0.0f64, 1.0f64);
         for d in 0..=self.depth.min(2) {
-            let len = self.groups[d].len();
+            let len = self.walk(d).len();
             if len == 0 {
                 break;
             }
@@ -902,7 +1043,8 @@ impl<'a> Searcher<'a> {
         let before = self.found_count();
         for d in 0..LEVELS {
             self.chosen[d] = gis[d] as u16;
-            let ns = self.apply(d, gis[d]);
+            let (k, def) = (self.groups[d][gis[d]].key, self.groups[d][gis[d]].def);
+            let ns = self.apply_key(d, k, def);
             if d == 0 {
                 self.rebuild_suffix();
             }
@@ -1015,7 +1157,7 @@ impl<'a> Searcher<'a> {
         }
         let (mut p, mut w) = (0.0f64, 1.0f64);
         for d in 1..=self.depth.min(3) {
-            let len = self.groups[d].len();
+            let len = self.walk(d).len();
             if len == 0 {
                 break;
             }
@@ -1033,7 +1175,7 @@ impl<'a> Searcher<'a> {
 
     /// Number of torso candidates (denominator of split-work progress)
     pub fn root_len(&self) -> usize {
-        self.groups[0].len()
+        self.walk(0).len()
     }
 
     /// Search nodes used so far.
@@ -1056,7 +1198,7 @@ impl<'a> Searcher<'a> {
                 }
             }
             let gi = self.levels[d].idx;
-            if gi >= self.groups[d].len() {
+            if gi >= self.walk(d).len() {
                 if d == 0 {
                     self.done = true;
                     return Status::Done;
@@ -1066,12 +1208,22 @@ impl<'a> Searcher<'a> {
             }
             self.levels[d].idx += 1;
             self.nodes += 1;
+            // Resistance / defense conditions: most armor-level children fail them right after being applied (the last
+            // part: 9.7M of 11.7M nodes with five elements and a minimum defense, 2026-11-22). Check them first, cheaply.
+            if self.quick && d < PARTS && self.quick_short(d, gi) {
+                if self.nodes >= stop {
+                    return Status::Paused;
+                }
+                continue;
+            }
             self.chosen[d] = gi as u16;
             let ns = self.apply(d, gi);
             if d == 0 {
                 self.rebuild_suffix();
             }
-            if d == CHARM_LEVEL {
+            if d == CHARM_LEVEL && !self.coarse[0].is_empty() {
+                self.expand(&ns);
+            } else if d == CHARM_LEVEL {
                 if self.views.is_empty() {
                     self.leaf(&ns);
                 } else {
@@ -1087,10 +1239,16 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    /// Choose walked group gi at level d (a coarse group with resistance conditions)
     fn apply(&mut self, d: usize, gi: usize) -> State {
-        let k = self.groups[d][gi].key;
+        let g = &self.walk(d)[gi];
+        let (k, def) = (g.key, g.def);
+        self.apply_key(d, k, def)
+    }
+
+    fn apply_key(&mut self, d: usize, k: Key, def: u16) -> State {
         let mut s = self.levels[d].state;
-        s.def += self.groups[d][gi].def;
+        s.def += def;
         if d < PARTS && !k.own {
             s.craft += 1;
             s.rare = s.rare.max(k.rare);
@@ -1127,6 +1285,70 @@ impl<'a> Searcher<'a> {
         s
     }
 
+    /// Groups the search walks at level d: coarse groups with resistance conditions (armor levels), else `groups`
+    fn walk(&self, d: usize) -> &[Group] {
+        if d < PARTS && !self.coarse[d].is_empty() { &self.coarse[d] } else { &self.groups[d] }
+    }
+
+    /// Resistance conditions: the whole set is chosen in coarse groups (s from them, its resistance and defense the
+    /// maxima); try every combination of their resistance groups and hand each to the leaf. Parts are chosen in level
+    /// order, cut by the most resistance and defense the remaining parts can still add.
+    fn expand(&mut self, s: &State) {
+        if s.def < self.min_def || self.res_short(s, LEVELS) {
+            return;
+        }
+        let picked: [u16; PARTS] = core::array::from_fn(|l| self.chosen[l]);
+        // Remaining maxima from part l on (the coarse groups' values) and the state without the armor parts' share
+        let mut rem_res = [[0i16; RES]; PARTS + 1];
+        let mut rem_def = [0u16; PARTS + 1];
+        let mut base = *s;
+        for l in (0..PARTS).rev() {
+            let c = &self.coarse[l][picked[l] as usize];
+            for e in 0..RES {
+                rem_res[l][e] = rem_res[l + 1][e] + c.key.res[e] as i16;
+            }
+            rem_def[l] = rem_def[l + 1] + c.def;
+        }
+        for e in 0..RES {
+            base.res[e] -= rem_res[0][e];
+        }
+        base.def -= rem_def[0];
+        self.expand_part(0, &base, &picked, &rem_res, &rem_def);
+        for l in 0..PARTS {
+            self.chosen[l] = picked[l];
+        }
+    }
+
+    fn expand_part(&mut self, l: usize, s: &State, picked: &[u16; PARTS], rem_res: &[[i16; RES]; PARTS + 1], rem_def: &[u16; PARTS + 1]) {
+        if l == PARTS {
+            if self.views.is_empty() {
+                self.leaf(s);
+            } else {
+                self.leaf_virtual(s);
+            }
+            return;
+        }
+        let c = &self.coarse[l][picked[l] as usize];
+        let (first, len) = (c.first as usize, c.len as usize);
+        for k in first..first + len {
+            let fi = self.coarse_fine[l][k];
+            let g = &self.groups[l][fi as usize];
+            let mut ns = *s;
+            ns.def += g.def;
+            for e in 0..RES {
+                ns.res[e] += g.key.res[e] as i16;
+            }
+            if ns.def + rem_def[l + 1] < self.min_def
+                || (0..RES).any(|e| self.min_res[e].is_some_and(|m| ns.res[e] + rem_res[l + 1][e] < m as i16))
+            {
+                continue;
+            }
+            self.nodes += 1;
+            self.chosen[l] = fi;
+            self.expand_part(l + 1, &ns, picked, rem_res, rem_def);
+        }
+    }
+
     fn rebuild_suffix(&mut self) {
         for d in (1..LEVELS).rev() {
             let tup = self.lvl_tup[d];
@@ -1151,10 +1373,76 @@ impl<'a> Searcher<'a> {
             }
             self.suf_val[d] = self.suf_val[d + 1] + v;
         }
+        if !self.lvl_valr.is_empty() {
+            let mut t = VAL_SCALE as i64 * self.torso_slots as i64;
+            for i in 0..self.nt {
+                t += self.rate[i] as i64 * (self.torso_proj[i] as i32).max(0).min(self.gcap[i]) as i64;
+            }
+            for x in 0..self.lvl_valr.len() {
+                for d in (1..LEVELS).rev() {
+                    let tup = if self.lvl_tupr[x][d] > NEG_VAL { t + self.lvl_tupr[x][d] } else { NEG_VAL };
+                    self.suf_valr[x][d] = self.suf_valr[x][d + 1] + self.lvl_valr[x][d].max(tup);
+                }
+            }
+        }
+    }
+
+    /// Resistance / defense conditions in the slot-equivalent bounds (lvl_valr): the value the remaining parts (from level
+    /// d, the charm level included) can still give to the targets while also giving the missing resistance and defense.
+    /// A set needs both from the same parts, so sum(value) <= sum(value + w x amount) - w x missing for every weight w;
+    /// the smallest over the weights. None when nothing is missing (then suf_val[d] is the bound).
+    fn cond_value(&self, s: &State, d: usize) -> Option<i64> {
+        if self.lvl_valr.is_empty() {
+            return None;
+        }
+        let (mut set, mut gap) = (0usize, 0i64);
+        for e in 0..RES {
+            if let Some(m) = self.min_res[e] {
+                let g = m as i64 - s.res[e] as i64;
+                if g > 0 {
+                    set |= 1 << e;
+                    gap += g;
+                }
+            }
+        }
+        let def_gap = (self.min_def as i64 - s.def as i64).max(0);
+        if def_gap > 0 {
+            set |= 1 << RES;
+        }
+        if set == 0 {
+            return None;
+        }
+        // With missing defense also the subset without it (the weight pairs give defense no zero weight)
+        let x = self.cond_idx[set] as usize;
+        let full = self.cond_w.iter().enumerate().map(|(w, &(wr, wd))| self.suf_valr[w * self.cond_n + x][d] - wr * gap - wd * def_gap);
+        let res_only = set & !(1 << RES);
+        let y = self.cond_idx[res_only] as usize;
+        let part = (def_gap > 0 && res_only != 0)
+            .then(|| self.cond_w.iter().enumerate().map(move |(w, &(wr, _))| self.suf_valr[w * self.cond_n + y][d] - wr * gap))
+            .into_iter()
+            .flatten();
+        full.chain(part).min()
+    }
+
+    /// The remaining parts' value for the targets: suf_val[d], or less with resistance / defense conditions (cond_value)
+    fn remaining_value(&self, s: &State, d: usize) -> i64 {
+        let v = self.suf_val[d] as i64;
+        self.cond_value(s, d).map_or(v, |r| r.min(v))
     }
 
     /// True if the targets cannot be reached even when levels from d on are filled most favorably.
     /// True if the resistance condition cannot be met even when the remaining parts give the most resistance. d = next level to choose.
+    /// Group gi at armor level d cannot meet the resistance or defense conditions even with the most the levels after it
+    /// can add (the same test res_short / prune make after applying it)
+    fn quick_short(&self, d: usize, gi: usize) -> bool {
+        let g = &self.walk(d)[gi];
+        let s = &self.levels[d].state;
+        if s.def + g.def + self.suf_def[d + 1] < self.min_def {
+            return true;
+        }
+        (0..RES).any(|e| self.min_res[e].is_some_and(|m| s.res[e] + g.key.res[e] as i16 + self.suf_res[d + 1][e] < m as i16))
+    }
+
     fn res_short(&self, s: &State, d: usize) -> bool {
         (0..RES).any(|e| self.min_res[e].is_some_and(|m| s.res[e] + self.suf_res[d][e] < m as i16))
     }
@@ -1187,11 +1475,13 @@ impl<'a> Searcher<'a> {
         if need > other + s.ts as u32 * mmax + cx {
             return true;
         }
-        if self.joint_short(s, d, bonus) {
+        // The remaining parts' value, once per node (with conditions it takes a few dozen lookups)
+        let rv = self.remaining_value(s, d);
+        if self.joint_short(s, d, bonus, rv) {
             return true;
         }
         // Free-slot upper bound: the smaller of the per-target estimate and the slot-equivalent bound
-        let joint_free = self.joint_free(s, d, bonus);
+        let joint_free = self.joint_free(s, d, bonus, rv);
         // Defense bound: the best remaining parts still cannot reach the minimum defense, or (defense priority, full results)
         // cannot beat the worst result's defense. Defense ranks first in that priority, so such a branch cannot enter the top
         // results; it is kept only if it can still be a non-dominated set. Without this, defense priority searched
@@ -1630,7 +1920,11 @@ impl<'a> Searcher<'a> {
         need -= saving[..2 - forced].iter().sum::<u32>();
         let other = (s.n[1] + 2 * s.n[2] + 3 * s.n[3] + self.suf_slots[d]) as u32;
         let mmax = 1 + s.k as u32 + self.suf_tup[d] as u32;
-        need > other + s.ts as u32 * mmax + self.charm_extra(s, d) || self.joint_short(s, d, bonus) || self.chance_short(s, d, bonus, self.charm_double(s, d))
+        if need > other + s.ts as u32 * mmax + self.charm_extra(s, d) {
+            return true;
+        }
+        let rv = self.remaining_value(s, d);
+        self.joint_short(s, d, bonus, rv) || self.chance_short(s, d, bonus, self.charm_double(s, d), rv)
     }
 
     /// Charm already chosen (in s.n) and talisman boost possible: its slots count once more (x2). Before the charm level it is in suf_val.
@@ -1667,7 +1961,8 @@ impl<'a> Searcher<'a> {
     /// Needed-charm mode with full results: true if, even with the best remaining parts, the needed charm value (in slots) is so high
     /// that the easiest such charm cannot beat the worst result's chance. d = next level to choose.
     /// The leaf (leaf_virtual) also only returns charms more likely than the worst, so cutting here gives the same results.
-    fn chance_short(&self, s: &State, d: usize, bonus: i16, fi: usize) -> bool {
+    /// rv = remaining_value(s, d)
+    fn chance_short(&self, s: &State, d: usize, bonus: i16, fi: usize, rv: i64) -> bool {
         let ctable = &self.ctables[fi];
         if self.results.len() < self.max_results || ctable.is_empty() {
             return false;
@@ -1681,8 +1976,8 @@ impl<'a> Searcher<'a> {
             }
         }
         let slots = (s.n[1] + 2 * s.n[2] + 3 * s.n[3]) as i64 + s.ts as i64 * (1 + s.k as i64) + self.chosen_charm_extra(s, d) as i64;
-        // Value of the remaining armor parts (excluding the charm slot)
-        let armor = self.suf_val[d] as i64 - self.lvl_val[CHARM_LEVEL] as i64;
+        // Value of the remaining armor parts (excluding the charm slot; charms give no resistance)
+        let armor = rv - self.lvl_val[CHARM_LEVEL] as i64;
         let want = deficit - VAL_SCALE as i64 * slots - armor;
         let at = if want <= 0 { 0 } else { ctable.partition_point(|e| (e.0 as i64) < want) };
         ctable.get(at).map_or(0, |e| e.1) <= floor
@@ -1690,7 +1985,8 @@ impl<'a> Searcher<'a> {
 
     /// Upper bound on free slots with the best remaining parts (slot-equivalent): (current slots + max of remaining parts - missing points
     /// converted) / scale. Torso slots count times the multiplier (decoration points are multiplied), so this is >= the real free slots (an upper bound).
-    fn joint_free(&self, s: &State, d: usize, bonus: i16) -> u32 {
+    /// rv = remaining_value(s, d)
+    fn joint_free(&self, s: &State, d: usize, bonus: i16, rv: i64) -> u32 {
         let mut deficit = 0u64;
         for i in 0..self.nt {
             let gap = self.need[i] - bonus - s.cur[i];
@@ -1698,15 +1994,16 @@ impl<'a> Searcher<'a> {
                 deficit += self.rate[i] as u64 * gap as u64;
             }
         }
-        let slots = (s.n[1] + 2 * s.n[2] + 3 * s.n[3]) as u64 + s.ts as u64 * (1 + s.k as u64) + self.chosen_charm_extra(s, d) as u64;
-        let cap = VAL_SCALE as u64 * slots + (self.suf_val[d] - self.charm_adj(s, d)) as u64;
-        (cap.saturating_sub(deficit) / VAL_SCALE as u64).min(u32::MAX as u64) as u32
+        let slots = (s.n[1] + 2 * s.n[2] + 3 * s.n[3]) as i64 + s.ts as i64 * (1 + s.k as i64) + self.chosen_charm_extra(s, d) as i64;
+        let cap = VAL_SCALE as i64 * slots + rv - self.charm_adj(s, d) as i64;
+        ((cap - deficit as i64).max(0) / VAL_SCALE as i64).min(u32::MAX as i64) as u32
     }
 
     /// Slot-equivalent bound: if the missing target points, converted to slot cost at the cheapest decoration ratio, exceed the current slots
     /// plus the sum of the max 'slots + target points' the remaining parts can give, no choice of the remaining parts works.
     /// d = next level to choose (torso is already chosen). The charm level is included in the remaining parts (max virtual charm when unowned).
-    fn joint_short(&self, s: &State, d: usize, bonus: i16) -> bool {
+    /// rv = remaining_value(s, d)
+    fn joint_short(&self, s: &State, d: usize, bonus: i16, rv: i64) -> bool {
         let mut deficit = 0u64;
         for i in 0..self.nt {
             let gap = self.need[i] - bonus - s.cur[i];
@@ -1714,11 +2011,8 @@ impl<'a> Searcher<'a> {
                 deficit += self.rate[i] as u64 * gap as u64;
             }
         }
-        if deficit == 0 {
-            return false;
-        }
-        let slots = (s.n[1] + 2 * s.n[2] + 3 * s.n[3]) as u64 + s.ts as u64 * (1 + s.k as u64) + self.chosen_charm_extra(s, d) as u64;
-        deficit > VAL_SCALE as u64 * slots + (self.suf_val[d] - self.charm_adj(s, d)) as u64
+        let slots = (s.n[1] + 2 * s.n[2] + 3 * s.n[3]) as i64 + s.ts as i64 * (1 + s.k as i64) + self.chosen_charm_extra(s, d) as i64;
+        deficit as i64 > VAL_SCALE as i64 * slots + rv - self.charm_adj(s, d) as i64
     }
 
     /// Decoration solver state with only the armor applied.
@@ -1778,7 +2072,8 @@ impl<'a> Searcher<'a> {
         }
         let secret = s.sec >= 10;
         let double = s.tal + if secret && s.tal != 0 { 2 } else { 0 } >= 10;
-        if self.chance_short(s, CHARM_LEVEL, if secret { 2 } else { 0 }, (double && self.tal_possible) as usize) {
+        let rv = self.remaining_value(s, CHARM_LEVEL);
+        if self.chance_short(s, CHARM_LEVEL, if secret { 2 } else { 0 }, (double && self.tal_possible) as usize, rv) {
             return;
         }
         let f: i16 = if double { 2 } else { 1 };
@@ -1988,4 +2283,38 @@ impl<'a> Searcher<'a> {
         self.offer(res);
         true
     }
+}
+
+// ---- Rarity priority in stages (owned charms) ----
+// A single pass with rarity priority had no free-slot bound for branches below the worst result's rarity: with a minimum
+// defense up to 300x more nodes than free-slot priority for the same sets (2026-11-22). The callers (plugin job.rs, the
+// query example) run it as stages instead: stage N is a free-slot search where unowned armor above rarity N is excluded,
+// and only its sets of rarity exactly N are kept (lower ones came from earlier stages). Stages stop once max results are
+// kept. Within one rarity, free-slot priority ranks like rarity priority (free slots, parts to craft, defense).
+
+/// Highest armor rarity (the last stage)
+pub fn stage_max_rarity(armor: &[Armor]) -> u8 {
+    armor.iter().map(|a| a.rare).max().unwrap_or(0)
+}
+
+/// Armor ids a stage leaves out: unowned armor above the rarity cap (`owned` sorted)
+pub fn stage_excluded(armor: &[Armor], owned: &[u16], cap: u8) -> Vec<u16> {
+    armor.iter().filter(|a| a.rare > cap && owned.binary_search(&a.id).is_err()).map(|a| a.id).collect()
+}
+
+/// Rarity of a set for rarity priority: per part the lowest-rarity member of its group (owned = 0), the highest of those
+pub fn set_rarity(s: &Searcher<'_>, armor: &[Armor], owned: &[u16], r: &SetResult) -> u8 {
+    (0..PARTS)
+        .map(|p| {
+            s.armor_members(p, r.groups[p])
+                .iter()
+                .map(|&i| {
+                    let a = &armor[i as usize];
+                    if owned.binary_search(&a.id).is_ok() { 0 } else { a.rare }
+                })
+                .min()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
 }

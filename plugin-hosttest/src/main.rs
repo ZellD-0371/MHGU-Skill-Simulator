@@ -19,7 +19,10 @@ mod generated {
     pub mod data;
     #[path = "../../../plugin/src/generated/strings.rs"]
     pub mod strings;
+    #[path = "../../../plugin/src/generated/unlock.rs"]
+    pub mod unlock;
 }
+use generated::strings as k;
 /// PC clock (the plugin uses the system tick)
 mod clock {
     use std::sync::OnceLock;
@@ -112,7 +115,6 @@ fn repro(db: &'static db::Db, path: &str) {
     a.kind = get("kind").parse().unwrap();
     a.weapon = get("weapon").parse().unwrap();
     a.forbid = get("forbid") == "1";
-    a.thorough = get("thorough") == "1";
     a.priority = get("priority").parse().unwrap_or(0);
     let t0 = std::time::Instant::now();
     a.run_search();
@@ -269,7 +271,8 @@ fn main() {
         (&[(19, 20), (71, 10)], 1, 1, [true, true, false], true, 0, 0),
         (&[(35, 10), (36, 10)], 1, 1, [true, false, false], true, 0, 0),
         (&[(19, 20), (71, 20), (35, 10)], 1, 1, [true, true, false], true, 0, 3),
-        (&[(46, 10), (19, 15)], 2, 2, [true, true, true], false, 1, 0),
+        // Priority 1 (defense) was removed from the plugin: rarity priority here
+        (&[(46, 10), (19, 15)], 2, 2, [true, true, true], false, 2, 0),
         (&[(19, 20), (71, 10)], 1, 3, [true, true, true], true, 2, 0),
     ];
     for (n, (targets, kind, weapon, ranks, forbid, priority, mindef)) in cases.iter().enumerate() {
@@ -294,7 +297,11 @@ fn main() {
                 }
             }
         }
+        mask |= 1 << 11; // rarity 11 = deviant armor: let through, filtered below
         let jewelrank = ranks.iter().rposition(|&r| r).unwrap() + 1;
+        // Deviant armor is off by default and nothing is owned here, so the plugin leaves every deviant piece out
+        let deviant = db.gd.armor.iter().filter(|a| a.deviant_rank() > 0).map(|a| a.id);
+        let excluded: Vec<String> = db.reward_armor.iter().copied().chain([db::PLACEHOLDER_ARMOR]).chain(deviant).map(|x| x.to_string()).collect();
         let args: Vec<String> = vec![
             "thorough=1".into(), // the plugin always searches thoroughly now
             format!("kind={kind}"),
@@ -310,8 +317,8 @@ fn main() {
             "needed=1".into(),
             format!("targets={}", targets.iter().map(|(t, p)| format!("{t}:{p}")).collect::<Vec<_>>().join(",")),
             "fixed=0,0,0,0,0".into(),
-            // Reward armor (no smithy recipe) is left out by the plugin unless owned or allowed: same for the engine here
-            format!("excluded={}", db.reward_armor.iter().chain([&db::PLACEHOLDER_ARMOR]).map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+            // Reward armor (no smithy recipe) and deviant armor are left out by the plugin unless owned or allowed: same for the engine here
+            format!("excluded={}", excluded.join(",")),
             "charms=-".into(),
             "max=30".into(),
             "owned=-".into(),
@@ -646,6 +653,263 @@ fn main() {
             }
         }
         println!("키 그림 이름: {}", if ok { "맞음" } else { "틀림" });
+        if !ok {
+            fails += 1;
+        }
+    }
+    // 9. Deviant armor: used only from its start rank on (any enabled rank at or above it) and when allowed or owned.
+    //    Targets a skill tree that only that deviant series has (Redhelm low, Drilltusk high, Elderfrost G).
+    {
+        let mut ok = true;
+        for (tree, start) in [(145u16, 1usize), (148, 2), (161, 3)] {
+            let pt = db.gd.skills.iter().filter(|s| s.tree == tree && s.threshold > 0).map(|s| s.threshold).min().unwrap();
+            let series: Vec<u16> = db.gd.armor.iter().filter(|a| a.skills.iter().any(|s| s.tree == tree && s.pt > 0)).map(|a| a.id).collect();
+            for rank in 0..3usize {
+                for (allow, own) in [(false, false), (true, false), (false, true)] {
+                    let owned = if own { series.iter().copied().collect() } else { Default::default() };
+                    db.set_inv(db::Inv { owned, loaded: true, ..Default::default() });
+                    let mut a = App::new(db);
+                    a.inline_build = true;
+                    a.targets = vec![skill_id(db, tree, pt)];
+                    a.ranks = core::array::from_fn(|i| i == rank);
+                    a.deviant = allow;
+                    a.run_search();
+                    run_to_end(&mut a);
+                    let want = (allow || own) && rank + 1 >= start;
+                    if a.results.is_empty() == want {
+                        println!("  실패: 이명 트리 {tree} 등급 {} 허용 {allow} 보유 {own} -> 결과 {}개", rank + 1, a.results.len());
+                        ok = false;
+                    }
+                }
+            }
+        }
+        db.set_inv(db::Inv::default());
+        println!("이명 방어구 등급·옵션: {}", if ok { "맞음" } else { "틀림" });
+        if !ok {
+            fails += 1;
+        }
+    }
+    // 10. 'Only gear the smithy can make' with a fake smithy list (the real one is read from game memory)
+    {
+        let mut ok = true;
+        let all_armor: std::collections::BTreeSet<u16> = db.gd.armor.iter().map(|a| a.id).collect();
+        let all_jewels: std::collections::BTreeSet<u16> = db.gd.jewels.iter().map(|j| j.id).collect();
+        let smithy = |armor: std::collections::BTreeSet<u16>, jewels: std::collections::BTreeSet<u16>, sig: u64| Some(db::Smithy { armor, jewels, deco_recipes: 0, sig });
+        let run = |inv: db::Inv, targets: Vec<u16>, deviant: bool| {
+            db.set_inv(inv);
+            let mut a = App::new(db);
+            a.inline_build = true;
+            a.targets = targets;
+            a.deviant = deviant;
+            a.smithy = true;
+            a.run_search();
+            run_to_end(&mut a);
+            a
+        };
+        // (a) List unreadable: the search is refused with a message
+        let a = run(db::Inv { loaded: true, ..Default::default() }, vec![skill_id(db, 19, 20)], false);
+        if a.message != k::MSG_SMITHY_UNREAD || !a.results.is_empty() {
+            println!("  실패: 대장간 목록 없음인데 검색함 (메시지 {})", a.message);
+            ok = false;
+        }
+        // (b) Armor: Redhelm's skill tree is only on Redhelm armor. Not on the list -> no set (and the cause analysis names
+        //     the smithy option); on the list -> sets; owned but not on the list -> sets
+        let target = vec![skill_id(db, 145, db.gd.skills.iter().filter(|s| s.tree == 145 && s.threshold > 0).map(|s| s.threshold).min().unwrap())];
+        let series: std::collections::BTreeSet<u16> = db.gd.armor.iter().filter(|a| a.skills.iter().any(|s| s.tree == 145 && s.pt > 0)).map(|a| a.id).collect();
+        let without: std::collections::BTreeSet<u16> = all_armor.difference(&series).copied().collect();
+        let a = run(db::Inv { loaded: true, smithy: smithy(without.clone(), all_jewels.clone(), 1), ..Default::default() }, target.clone(), true);
+        let named = a.diag.iter().any(|(l, _)| matches!(l, app::DiagLabel::Smithy));
+        if !a.results.is_empty() || !named {
+            println!("  실패: 대장간에 없는 홍두 방어구 결과 {}개, 원인 분석 대장간 제안 {named}", a.results.len());
+            ok = false;
+        }
+        let a = run(db::Inv { loaded: true, smithy: smithy(all_armor.clone(), all_jewels.clone(), 2), ..Default::default() }, target.clone(), true);
+        if a.results.is_empty() {
+            println!("  실패: 대장간에 있는 홍두 방어구인데 결과 없음");
+            ok = false;
+        }
+        let a = run(db::Inv { loaded: true, owned: series.clone(), smithy: smithy(without, all_jewels.clone(), 3), ..Default::default() }, target, true);
+        if a.results.is_empty() {
+            println!("  실패: 가진 홍두 방어구인데 대장간 목록 밖이라 빠짐");
+            ok = false;
+        }
+        // (c) Decorations: with an empty smithy decoration list no set may use a decoration
+        let three: Vec<u16> = [(19, 20), (72, 10), (35, 10)].iter().map(|&(t, p)| skill_id(db, t, p)).collect();
+        let a = run(db::Inv { loaded: true, smithy: smithy(all_armor.clone(), Default::default(), 4), ..Default::default() }, three.clone(), false);
+        let used = a.results.iter().filter(|s| !s.jewels.is_empty()).count();
+        let b = run(db::Inv { loaded: true, smithy: smithy(all_armor, all_jewels, 5), ..Default::default() }, three, false);
+        let used_all = b.results.iter().filter(|s| !s.jewels.is_empty()).count();
+        if used != 0 || used_all == 0 {
+            println!("  실패: 장식품 목록 비움 -> 장식품 쓴 세트 {used}개 (목록 전체일 때 {used_all}개)");
+            ok = false;
+        }
+        db.set_inv(db::Inv::default());
+        println!("대장간에서 만들 수 있는 장비만: {}", if ok { "맞음" } else { "틀림" });
+        if !ok {
+            fails += 1;
+        }
+    }
+    // 11. 'Nothing with owned charms' memory: newly owned armor (e.g. a quest reward) must not reuse it
+    {
+        let six: Vec<u16> = [(19, 20), (72, 10), (35, 10), (36, 10), (6, 10), (71, 10)].iter().map(|&(t, p)| skill_id(db, t, p)).collect();
+        let seven: Vec<u16> = six.iter().copied().chain(core::iter::once(skill_id(db, 46, 10))).collect();
+        db.set_inv(db::Inv { loaded: true, ..Default::default() });
+        let mut a = App::new(db);
+        a.inline_build = true;
+        a.targets = six;
+        a.run_search();
+        run_to_end(&mut a);
+        // Same charms, one more owned armor piece
+        let reward = db.reward_armor[0];
+        db.set_inv(db::Inv { loaded: true, owned: [reward].into_iter().collect(), ..Default::default() });
+        a.targets = seven;
+        a.run_search();
+        run_to_end(&mut a);
+        let skipped = a.last_search.take().is_some_and(|s| s.owned_skipped);
+        db.set_inv(db::Inv::default());
+        let ok = !skipped;
+        println!("보유 방어구가 바뀐 뒤 '결과 없음' 기억 안 씀: {}", if ok { "맞음" } else { "틀림" });
+        if !ok {
+            fails += 1;
+        }
+    }
+    // 12. Excluding a decoration from the results: X on a part row with decorations opens its exclude list (armor first,
+    //     then the decorations); picking a decoration and confirming searches again without it, and it is saved
+    {
+        let mut ok = true;
+        db.set_inv(db::Inv { loaded: true, ..Default::default() });
+        let mut a = App::new(db);
+        a.inline_build = true;
+        a.targets = [(19, 20), (72, 10), (35, 10)].iter().map(|&(t, p)| skill_id(db, t, p)).collect();
+        a.run_search();
+        run_to_end(&mut a);
+        // First result row with a decoration in an armor part
+        let pick = a.results.iter().enumerate().find_map(|(i, s)| {
+            let (placed, _) = s.placement(db);
+            (0..PARTS).find(|&p| !placed[p].is_empty()).map(|p| (i, p, placed[p][0]))
+        });
+        match pick {
+            None => {
+                println!("  실패: 장식품을 쓰는 결과가 없어 검사할 수 없음");
+                ok = false;
+            }
+            Some((i, p, jewel)) => {
+                a.ridx = a.rows().iter().position(|r| *r == Some(i)).unwrap_or(0);
+                a.focus = app::Focus::Parts;
+                a.pidx = p;
+                a.press(Button::X);
+                let items = a.exclude_items();
+                let at = items.iter().position(|x| *x == app::ExItem::Jewel(jewel));
+                if a.exmenu.is_none() || items.first() != Some(&app::ExItem::Armor(a.current().unwrap().head(p))) || at.is_none() {
+                    println!("  실패: 제외 목록이 안 열리거나 내용이 다름 (열림 {})", a.exmenu.is_some());
+                    ok = false;
+                } else {
+                    for _ in 0..at.unwrap() {
+                        a.press(Button::Down);
+                    }
+                    a.press(Button::A); // pick the decoration
+                    a.press(Button::A); // confirm (cursor on 'yes')
+                    run_to_end(&mut a);
+                    let used = a.results.iter().filter(|s| s.jewels.iter().any(|j| j.0 == jewel)).count();
+                    let saved = a.encode().contains(&format!("excluded_jewels={jewel}"));
+                    if a.excluded_jewels != vec![jewel] || used != 0 || !saved {
+                        println!("  실패: 제외 목록 {:?}, 그 장식품을 쓰는 결과 {used}개, 저장 {saved}", a.excluded_jewels);
+                        ok = false;
+                    }
+                }
+            }
+        }
+        db.set_inv(db::Inv::default());
+        println!("장식품 제외: {}", if ok { "맞음" } else { "틀림" });
+        if !ok {
+            fails += 1;
+        }
+    }
+    // 13. Unowned-charm results: fixing a part (Y) or excluding armor (X) searches again without asking about unowned
+    //     charms again (the narrower condition skips the owned-charm phase from memory and goes on with unowned charms)
+    {
+        let mut ok = true;
+        db.set_inv(db::Inv { loaded: true, ..Default::default() });
+        let mut a = App::new(db);
+        a.inline_build = true;
+        a.targets = [(19, 20), (72, 10), (35, 10), (36, 10), (6, 10), (71, 10)].iter().map(|&(t, p)| skill_id(db, t, p)).collect();
+        a.run_search();
+        run_to_end(&mut a);
+        // Run to the end, counting the unowned-charm questions (answered yes so the run can finish)
+        let asked_run = |a: &mut App| -> usize {
+            let mut asked = 0;
+            let mut guard = 0;
+            while a.job.is_some() || a.building.is_some() {
+                a.tick(1000);
+                for i in 0..job::MAX_HELPERS {
+                    job::helper_run(i, 5);
+                }
+                if a.job.as_ref().is_some_and(|j| j.state == job::State::AskNeeded) {
+                    asked += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    if a.job.as_ref().is_some_and(|j| j.ask_ready()) {
+                        a.press(Button::A);
+                    }
+                }
+                guard += 1;
+                assert!(guard < 100_000, "검색이 끝나지 않는다");
+            }
+            asked
+        };
+        if !a.needed_mode || a.results.is_empty() {
+            println!("  실패: 미보유 호석 결과가 아님 (needed {}, 결과 {}개)", a.needed_mode, a.results.len());
+            ok = false;
+        } else {
+            if a.notice.is_some() {
+                a.press(Button::A); // close the 'searched with unowned charms' notice
+            }
+            a.ridx = a.rows().iter().position(|r| r.is_some()).unwrap_or(0);
+            a.focus = app::Focus::Parts;
+            a.pidx = 1;
+            a.press(Button::Y); // fix this part from the results
+            let asked = asked_run(&mut a);
+            let skipped = a.last_search.take().is_some_and(|s| s.owned_skipped);
+            if asked != 0 || !skipped || !a.needed_mode || a.results.is_empty() || a.fixed[1] == 0 || a.notice.is_some() {
+                println!(
+                    "  실패: 고정 후 질문 {asked}번, 보유 단계 건너뜀 {skipped}, needed {}, 결과 {}개, 알림 {}",
+                    a.needed_mode,
+                    a.results.len(),
+                    a.notice.is_some()
+                );
+                ok = false;
+            }
+            // Exclude another part's armor (X, then 'yes')
+            if a.notice.is_some() {
+                a.press(Button::A);
+            }
+            a.ridx = a.rows().iter().position(|r| r.is_some()).unwrap_or(0);
+            a.focus = app::Focus::Parts;
+            a.pidx = 2;
+            a.press(Button::X);
+            if a.exmenu.is_some() {
+                a.press(Button::A); // the armor (first item)
+            }
+            a.press(Button::A); // confirm
+            let asked = asked_run(&mut a);
+            if asked != 0 || a.excluded.is_empty() || !a.needed_mode || a.notice.is_some() {
+                println!("  실패: 빼기 후 질문 {asked}번, 뺀 방어구 {}개, needed {}, 알림 {}", a.excluded.len(), a.needed_mode, a.notice.is_some());
+                ok = false;
+            }
+            // A new search from the main screen still asks
+            a.press(Button::B);
+            a.screen = app::Screen::Main;
+            a.fixed = [0; PARTS];
+            a.excluded.clear();
+            a.targets.push(skill_id(db, 46, 10));
+            a.run_search();
+            let asked = asked_run(&mut a);
+            if asked == 0 || (a.needed_mode && a.notice.is_none()) {
+                println!("  실패: 메인 화면의 새 검색에서 질문 {asked}번, 미보유 결과 알림 {}", a.notice.is_some());
+                ok = false;
+            }
+        }
+        db.set_inv(db::Inv::default());
+        println!("미보유 호석 결과에서 고정·빼기 후 다시 묻거나 알리지 않음: {}", if ok { "맞음" } else { "틀림" });
         if !ok {
             fails += 1;
         }

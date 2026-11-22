@@ -575,6 +575,7 @@ fn ext_view(cv: &Cv, app: &App) -> crate::ext_block::Ext {
         || app.popup.is_some()
         || app.compare
         || app.fixmenu.is_some()
+        || app.exmenu.is_some()
         || app.drop.is_some()
         || app.sub.is_some()
         || app.subdrop.is_some();
@@ -640,6 +641,7 @@ fn share_view(cv: &Cv, app: &App) -> crate::window_view::View {
         || app.extra_busy()
         || app.menu.is_some()
         || app.fixmenu.is_some()
+        || app.exmenu.is_some()
         || app.drop.is_some()
         || app.sub.is_some()
         || app.subdrop.is_some();
@@ -829,7 +831,7 @@ fn mouse(cv: &Cv, app: &mut App, hits: &[([f32; 4], Target)]) -> Vec<Button> {
                 crate::sound::cue(crate::sound::Cue::Move);
             }
         } else if moved {
-            let cursors = |a: &App| ((a.col, a.row, a.ridx, a.pidx, a.aidx, a.dialog_sel, a.sidx, a.eidx, a.midx, a.bidx), (a.drop, a.sub, a.subdrop, a.menu, a.fixmenu));
+            let cursors = |a: &App| ((a.col, a.row, a.ridx, a.pidx, a.aidx, a.dialog_sel, a.sidx, a.eidx, a.midx, a.bidx), (a.drop, a.sub, a.subdrop, a.menu, a.fixmenu, a.exmenu));
             let snap = cursors(app);
             app.mouse_target(t, false);
             if snap != cursors(app) {
@@ -892,6 +894,9 @@ fn draw_all(cv: &Cv, app: &mut App) {
     if app.fixmenu.is_some() {
         draw_fixmenu(cv, app);
     }
+    if app.exmenu.is_some() {
+        draw_exmenu(cv, app);
+    }
     draw_dialog(cv, app);
     // Help line: explains what is under the cursor (shared by every screen)
     if let Some(key) = help_key(app) {
@@ -925,6 +930,7 @@ fn option_label(opt: Opt) -> u16 {
         Opt::Kind => k::KIND,
         Opt::Weapon => k::WEAPON,
         Opt::Armor => k::ARMOR,
+        Opt::Smithy => k::SMITHY,
         Opt::MinDef => k::MINDEF,
         Opt::Resist => k::RESIST,
         Opt::Priority => k::PRIORITY,
@@ -1016,6 +1022,17 @@ fn draw_main(cv: &Cv, app: &App) {
             cv.text(640., y + 13., &format!("▶ {}", t(app, k::SEARCH)), 21., GOLD, None, MM);
             continue;
         }
+        if opt == Opt::Smithy {
+            // Long label in some languages: smaller first, then cut with '…' (the help line has the full text)
+            let label = t(app, k::SMITHY);
+            let room = 770. - 480.;
+            let size = if cv.measure(19., label) <= room { 19. } else { 17. };
+            // Dimmed when the smithy list could not be read (searching with it on is refused)
+            let readable = app.db.inv().smithy.is_some();
+            cv.text(480., y + (19. - size) / 2., label, size, if readable { TEXT } else { MUTED }, Some(room), LA);
+            cv.checkbox(782., y + 3., app.smithy);
+            continue;
+        }
         cv.tx(480., y, t(app, option_label(opt)), 19., TEXT);
         if opt.choices() > 0 {
             cv.text(778., y, &option_value(app, opt, app.opt_value(opt)), 19., GOLD, None, RA);
@@ -1032,7 +1049,7 @@ fn draw_main(cv: &Cv, app: &App) {
         }
     }
     cv.line(466., 556., 814., 556., LINE, 1.);
-    cv.text(640., 582., &fmt2(t(app, k::STATUS), app.excluded.len(), app.saved.len()), 16., MUTED, None, MM);
+    cv.text(640., 582., &fmt2(t(app, k::STATUS), app.excluded.len() + app.excluded_jewels.len(), app.saved.len()), 16., MUTED, None, MM);
     // Right: fixed equipment
     cv.panel(844., 70., 1220., 610., Some(t(app, k::FIX_TITLE)), true);
     for slot in 0..FIX_ROWS {
@@ -1065,7 +1082,7 @@ fn draw_main(cv: &Cv, app: &App) {
         let top = (row_top + 40.).min(600. - 58. - rows as f32 * 42.);
         cv.popup(472., top, 816., top + 56. + rows as f32 * 42.);
         cv.tx(490., top + 12., t(app, if opt == Opt::Armor { k::ARMOR } else { k::RES_TITLE }), 16., MUTED);
-        let armor_keys = [k::RANK0, k::RANK1, k::RANK2, k::ARENA, k::EVENT, k::REWARD];
+        let armor_keys = [k::RANK0, k::RANK1, k::RANK2, k::DEVIANT, k::ARENA, k::REWARD, k::EVENT];
         for i in 0..rows {
             let y = top + 46. + i as f32 * 42.;
             cv.row(480., y - 5., 808., y + 33., i == idx, Target::Sub(i));
@@ -1100,7 +1117,7 @@ fn draw_main(cv: &Cv, app: &App) {
             let y = 254. + i as f32 * 48.;
             cv.row(432., y - 6., 848., y + 36., i == m, Target::Menu(i));
             let (key, count) = match item {
-                MenuItem::Excluded => (k::EXCLUDED, Some(app.excluded.len())),
+                MenuItem::Excluded => (k::EXCLUDED, Some(app.excluded.len() + app.excluded_jewels.len())),
                 MenuItem::ResetTargets => (k::RESET_TARGETS, None),
                 MenuItem::ResetFixed => (k::RESET_FIXED, None),
             };
@@ -1131,21 +1148,53 @@ fn draw_fixmenu(cv: &Cv, app: &App) {
     }
 }
 
+/// The results' exclude list (X on a part row): the part's armor and its decorations
+fn draw_exmenu(cv: &Cv, app: &App) {
+    let idx = app.exmenu.unwrap_or(0);
+    let items = app.exclude_items();
+    let bottom = 300. + items.len() as f32 * 48.;
+    cv.round(420., 220., 860., bottom, 10., PANEL);
+    cv.round_outline(420., 220., 860., bottom, 10., GOLD);
+    cv.text(640., 248., t(app, k::EXCLUDE_PICK), 18., MUTED, None, MM);
+    for (i, item) in items.iter().enumerate() {
+        let y = 284. + i as f32 * 48.;
+        cv.row(432., y - 6., 848., y + 36., i == idx, Target::Ex(i));
+        excluded_row(cv, app, *item, 452., y, 380.);
+    }
+}
+
+/// Icon and name of an excluded (or to-be-excluded) armor piece or decoration
+fn excluded_row(cv: &Cv, app: &App, item: ExItem, x: f32, y: f32, width: f32) {
+    match item {
+        ExItem::Armor(id) => {
+            if let Some(a) = app.db.armor(id) {
+                cv.armor_icon(a, x, y, 30.);
+            }
+            cv.text(x + 46., y, nm(app, names::ARMOR, id), 21., TEXT, Some(width), LA);
+        }
+        ExItem::Jewel(id) => {
+            cv.sprite("jewel", x, y, 30., 0xffffff, false);
+            cv.text(x + 46., y, nm(app, names::JEWEL, id), 21., TEXT, Some(width), LA);
+        }
+    }
+}
+
 fn draw_manage(cv: &Cv, app: &App) {
-    let items = &app.excluded;
+    let items = app.manage_items();
     cv.panel(60., 70., 1220., 610., Some(&format!("{}  {}", t(app, k::EXCLUDED), items.len())), false);
     if items.is_empty() {
         cv.text(640., 340., t(app, k::NONE), 21., MUTED, None, MM);
     }
     let top = app.midx / MANAGE_ROWS * MANAGE_ROWS;
-    for (row, &aid) in items.iter().enumerate().skip(top).take(MANAGE_ROWS) {
+    for (row, &item) in items.iter().enumerate().skip(top).take(MANAGE_ROWS) {
         let y = 120. + (row - top) as f32 * 41.;
         cv.row(74., y - 5., 1190., y + 35., row == app.midx, Target::Manage(row));
-        if let Some(a) = app.db.armor(aid) {
-            cv.armor_icon(a, 90., y, 30.);
-            cv.text(1170., y + 2., &format!("{} {}", t(app, k::COL_DEF), a.def), 19., TEXT, None, RA);
+        excluded_row(cv, app, item, 90., y, 600.);
+        if let ExItem::Armor(aid) = item {
+            if let Some(a) = app.db.armor(aid) {
+                cv.text(1170., y + 2., &format!("{} {}", t(app, k::COL_DEF), a.def), 19., TEXT, None, RA);
+            }
         }
-        cv.text(136., y, nm(app, names::ARMOR, aid), 21., TEXT, Some(600.), LA);
     }
     cv.pager(app, 640., 568., items.len(), MANAGE_ROWS, top, 0);
 }
@@ -1261,7 +1310,7 @@ fn draw_list(cv: &Cv, app: &App) {
     let needed = !saved && app.needed_mode;
     if !saved {
         // How these results were found: incl. unowned charms · earlier result (same condition remembered)
-        let (_, cached) = app.results_info;
+        let cached = app.results_cached;
         let parts: Vec<&str> = [(needed, k::RES_NEEDED), (cached, k::RES_CACHED)].iter().filter(|x| x.0).map(|x| t(app, x.1)).collect();
         if !parts.is_empty() {
             cv.text(426., 86., &parts.join(" · "), 14., MUTED, Some(240.), RA);
@@ -1532,9 +1581,11 @@ fn draw_detail(cv: &Cv, app: &App, r: &Set) {
             None => counts.push((j, 1)),
         }
     }
-    for (j, n) in &counts {
-        cv.text(82., y, &format!("{} ×{}", nm(app, names::JEWEL, *j), n), 18., TEXT, Some(330.), LA);
-        y += 27.;
+    // One per line; when they would run past the panel's bottom (many armor skills + several decorations), two columns
+    let two = y + counts.len() as f32 * 27. > 598.;
+    for (i, (j, n)) in counts.iter().enumerate() {
+        let (x, yy, w) = if two { (82. + (i % 2) as f32 * 172., y + (i / 2) as f32 * 27., 164.) } else { (82., y + i as f32 * 27., 330.) };
+        cv.text(x, yy, &format!("{} ×{}", nm(app, names::JEWEL, *j), n), 18., TEXT, Some(w), LA);
     }
     if counts.is_empty() {
         cv.tx(82., y, "—", 18., MUTED);
@@ -1699,7 +1750,8 @@ fn draw_results(cv: &Cv, app: &mut App) {
         cv.popup(300., 100., 980., 606.);
         cv.tx(320., 112., t(app, if app.extra_any { k::EXTRA_TITLE_ANY } else { k::EXTRA_TITLE }), 18., MUTED);
         if extra.is_empty() {
-            cv.text(640., 360., t(app, k::EXTRA_NONE), 18., MUTED, None, MM);
+            cv.text(640., 348., t(app, k::EXTRA_NONE), 18., MUTED, None, MM);
+            cv.text(640., 376., t(app, k::EXTRA_NONE2), 15., MUTED, None, MM);
         }
         // Category tabs like the skill picker (only categories with skills), L/R or a click to switch
         let tabs = app.extra_tabs();
@@ -1998,10 +2050,11 @@ fn draw_dialog(cv: &Cv, app: &mut App) {
             let (a, b) = match app.confirm.unwrap() {
                 Confirm::ResetTargets => (k::CONFIRM_RESET_TARGETS, Some(k::CONFIRM_NOTE)),
                 Confirm::ResetFixed => (k::CONFIRM_RESET_FIXED, Some(k::CONFIRM_NOTE)),
-                Confirm::Release(_) => (k::CONFIRM_RELEASE, Some(k::CONFIRM_RELEASE2)),
+                Confirm::Release(_) | Confirm::ReleaseJewel(_) => (k::CONFIRM_RELEASE, Some(k::CONFIRM_RELEASE2)),
                 Confirm::ReleaseAll => (k::CONFIRM_RELEASE_ALL, Some(k::CONFIRM_RELEASE_ALL2)),
                 Confirm::Save => (k::CONFIRM_SAVE, Some(k::CONFIRM_SAVE2)),
                 Confirm::Exclude(_) => (k::CONFIRM_EXCLUDE, Some(k::CONFIRM_EXCLUDE2)),
+                Confirm::ExcludeJewel(_) => (k::CONFIRM_EXCLUDE_JEWEL, Some(k::CONFIRM_EXCLUDE2)),
                 Confirm::DeleteSaved(_) => (k::CONFIRM_DELETE_SAVED, Some(k::CONFIRM_DELETE_SAVED2)),
                 Confirm::ExtraAny => (k::CONFIRM_EXTRA_ANY, Some(k::CONFIRM_EXTRA_ANY2)),
                 Confirm::LeaveResults => (k::CONFIRM_LEAVE_RESULTS, None),
@@ -2027,6 +2080,10 @@ fn draw_dialog(cv: &Cv, app: &mut App) {
                 m if m == k::MSG_NOTHING_WORN => t(app, k::MSG_NOTHING_WORN2).into(),
                 m if m == k::MSG_SAVED_FULL => t(app, k::MSG_SAVED_FULL2).into(),
                 m if m == k::EXTRA_NONE_ANY => t(app, k::EXTRA_NONE_ANY2).into(),
+                m if m == k::MSG_NO_TARGET => t(app, k::MSG_NO_TARGET2).into(),
+                m if m == k::MSG_FULL => t(app, k::MSG_FULL2).into(),
+                m if m == k::MSG_NO_RANK => t(app, k::MSG_NO_RANK2).into(),
+                m if m == k::MSG_SMITHY_UNREAD => t(app, k::MSG_SMITHY_UNREAD2).into(),
                 _ => String::new(),
             };
             (title, note)
@@ -2037,12 +2094,24 @@ fn draw_dialog(cv: &Cv, app: &mut App) {
         Some(Confirm::Exclude(id) | Confirm::Release(id)) if kind == Dialog::Confirm => app.db.armor(id).map(|a| (a, id)),
         _ => None,
     };
+    let jewel = match app.confirm {
+        Some(Confirm::ExcludeJewel(id) | Confirm::ReleaseJewel(id)) if kind == Dialog::Confirm => Some(id),
+        _ => None,
+    };
     let target = match app.confirm {
         Some(Confirm::DeleteSaved(i)) if kind == Dialog::Confirm => app.saved.get(i).map(|r| format!("{}   {} · {}", set_label(cv, app, r, 20., 560.), fmt1(t(app, k::FREE_N), r.free), r.def)),
         _ => None,
     };
-    let item_w = if let Some((_, id)) = item { cv.measure(22., nm(app, names::ARMOR, id)) + 44. } else if let Some(s) = &target { cv.measure(20., s) } else { 0. };
-    let has_box = item.is_some() || target.is_some();
+    let item_w = if let Some((_, id)) = item {
+        cv.measure(22., nm(app, names::ARMOR, id)) + 44.
+    } else if let Some(id) = jewel {
+        cv.measure(22., nm(app, names::JEWEL, id)) + 44.
+    } else if let Some(s) = &target {
+        cv.measure(20., s)
+    } else {
+        0.
+    };
+    let has_box = item.is_some() || jewel.is_some() || target.is_some();
     let text_w = cv.measure(22., &title).max(if note.is_empty() { 0. } else { cv.measure(17., &note) }).max(item_w + 40.);
     let w = (text_w + 120.).clamp(440., 760.);
     let h = if note.is_empty() { 160. } else { 196. } + if has_box { 54. } else { 0. };
@@ -2055,6 +2124,12 @@ fn draw_dialog(cv: &Cv, app: &mut App) {
         cv.rect(bx, y0 + 72., bx + bw, y0 + 116., SELECT);
         cv.armor_icon(a, bx + 20., y0 + 79., 30.);
         cv.text(bx + 60., y0 + 94., nm(app, names::ARMOR, id), 22., rare_color(a.rare), None, LM);
+    } else if let Some(id) = jewel {
+        let bw = item_w + 40.;
+        let bx = 640. - bw / 2.;
+        cv.rect(bx, y0 + 72., bx + bw, y0 + 116., SELECT);
+        cv.sprite("jewel", bx + 20., y0 + 79., 30., 0xffffff, false);
+        cv.text(bx + 60., y0 + 94., nm(app, names::JEWEL, id), 22., TEXT, None, LM);
     } else if let Some(s) = &target {
         let bw = item_w + 40.;
         cv.rect(640. - bw / 2., y0 + 72., 640. + bw / 2., y0 + 116., SELECT);
@@ -2173,6 +2248,7 @@ fn diag_label(app: &App, l: &DiagLabel) -> String {
         DiagLabel::Res => t(app, k::DIAG_RES).into(),
         DiagLabel::Fixed => t(app, k::DIAG_FIXED).into(),
         DiagLabel::Excluded => t(app, k::DIAG_EXCLUDED).into(),
+        DiagLabel::Smithy => t(app, k::DIAG_SMITHY).into(),
         DiagLabel::Lower(a, b) => fmt2(t(app, k::DIAG_LOWER), skill_name(app, *a), skill_name(app, *b)),
         DiagLabel::Remove(a) => fmt1(t(app, k::DIAG_REMOVE), skill_name(app, *a)),
     }
@@ -2276,6 +2352,7 @@ fn help_key(app: &App) -> Option<u16> {
                 Some(Opt::Kind) => k::HELP_KIND,
                 Some(Opt::Weapon) => k::HELP_WEAPON,
                 Some(Opt::Armor) => k::HELP_ARMOR,
+                Some(Opt::Smithy) => k::HELP_SMITHY,
                 Some(Opt::MinDef) => k::HELP_MINDEF,
                 Some(Opt::Resist) => k::HELP_RESIST,
                 Some(Opt::Priority) => k::HELP_PRIORITY,

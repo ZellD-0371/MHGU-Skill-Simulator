@@ -21,6 +21,10 @@ cd "$ROOT"
 if [ -f "$ROOT/../Database/mhxx_all_tables.json" ]; then
   PYTHONIOENCODING=utf-8 py -3.10 tools/build_plugin_data.py
   PYTHONIOENCODING=utf-8 py -3.10 tools/build_armor_map.py || { echo "방어구 대응표 검증 실패"; exit 1; }
+  # Smithy list unlock data (needs the unpacked game tables next to the repository; without them the committed file is used)
+  if [ -d "$ROOT/../UnpakingGU/backup/romfs/nativeNX/table" ]; then
+    PYTHONIOENCODING=utf-8 py -3.10 tools/build_unlock_data.py || { echo "대장간 해금 데이터 생성 실패"; exit 1; }
+  fi
 else
   echo "../Database 없음: 저장소에 들어 있는 생성 데이터를 그대로 씁니다"
 fi
@@ -37,6 +41,12 @@ fi
 # (2026-11-18 crash: the compiler fused two u64 saturating_sub into one vqsub.u64). Replace with plain arithmetic.
 if arm-none-eabi-objdump -d "$ELF" | grep -E '\bvq(add|sub)\.[us]64\b'; then
   echo "Recomp 미지원 명령어(NEON 64비트 포화 연산)가 있다" >&2
+  exit 1
+fi
+# NEON 'three registers of different lengths' (long / wide / narrow ops) are unknown to the Recomp interpreter as well
+# (2026-11-22 crash: 'unsupported neon 3diff', a vaddw.u8 the compiler made from collecting u8 + u16 values)
+if arm-none-eabi-objdump -d "$ELF" | grep -E '[[:space:]]v(q?d?(add|sub|mul|mla|mls|abd|aba)[lw]|r?(add|sub)hn|qdmull|qdmlal|qdmlsl)[.]'; then
+  echo "Recomp 미지원 명령어(NEON 길이 다른 연산)가 있다" >&2
   exit 1
 fi
 # Must fit comfortably in the Recomp plugin memory area (12 MB) shared by all plugins

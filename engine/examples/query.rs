@@ -53,6 +53,10 @@ fn extra_skills(gd: &GameData, base: &Query, targets: &[Target]) {
 }
 
 fn print_set(gd: &GameData, s: &Searcher, mode: &str, min_def: u16, tag: &str, r: &skillsim_engine::search::SetResult) {
+    println!("{}", set_line(gd, s, mode, min_def, tag, r));
+}
+
+fn set_line(gd: &GameData, s: &Searcher, mode: &str, min_def: u16, tag: &str, r: &skillsim_engine::search::SetResult) -> String {
     let parts: Vec<String> = (0..PARTS)
         .map(|p| {
             let members = s.armor_members(p, r.groups[p]);
@@ -85,7 +89,7 @@ fn print_set(gd: &GameData, s: &Searcher, mode: &str, min_def: u16, tag: &str, r
     } else {
         "-".to_string()
     };
-    println!(
+    format!(
         "{} {} {} {} {} {} {} {} {:e} {}",
         tag,
         r.free,
@@ -97,7 +101,7 @@ fn print_set(gd: &GameData, s: &Searcher, mode: &str, min_def: u16, tag: &str, r
         need,
         r.chance as f64 / 1e15,
         rare,
-    );
+    )
 }
 
 /// Alternatives: from the given set (5 parts in fixed, its charm as the single entry in charms) free one part
@@ -155,6 +159,15 @@ fn main() {
     let mut negative_trees: Vec<u16> = gd.skills.iter().filter(|s| s.threshold < 0).map(|s| s.tree).collect();
     negative_trees.sort();
     negative_trees.dedup();
+    // jewels=id,id,...: only these decorations (the plugin's 'smithy only' list); '-' or missing = no list
+    let jewel_ids: Option<Vec<u16>> = match get("jewels", "-").as_str() {
+        "-" => None,
+        v => {
+            let mut ids: Vec<u16> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            ids.sort();
+            Some(ids)
+        }
+    };
     let q = Query {
         negative_trees: &negative_trees,
         targets: &targets,
@@ -164,6 +177,7 @@ fn main() {
         weapon_slots: get("weapon", "0").parse().unwrap(),
         exclude_flags: get("exflags", "0").parse().unwrap(),
         jewel_rank: get("jewelrank", "3").parse().unwrap(),
+        jewel_ids: jewel_ids.as_deref(),
         priority,
         forbid_negative: get("forbid", "1") == "1",
         dominance: get("dominance", "1") == "1",
@@ -198,7 +212,18 @@ fn main() {
     let budget: u64 = get("budget", "50000000").parse().unwrap();
     let t0 = Instant::now();
     let mut mode = "owned";
-    let mut s = match Searcher::new(&gd.armor, &gd.jewels, &q) {
+    // Rarity priority with owned charms runs in stages of rising rarity cap (engine search.rs 'Rarity priority in
+    // stages', same as the plugin): free-slot searches without unowned armor above the cap, keeping sets of exactly that rarity
+    let mut owned_sorted = owned.clone();
+    owned_sorted.sort();
+    let staged = priority == 2 && get("first", "0") != "1" && get("neededonly", "0") != "1";
+    let stage_max = if staged { skillsim_engine::search::stage_max_rarity(&gd.armor) } else { 0 };
+    let stage_ex: Vec<Vec<u16>> = (0..=stage_max)
+        .map(|cap| if staged { excluded.iter().copied().chain(skillsim_engine::search::stage_excluded(&gd.armor, &owned_sorted, cap)).collect() } else { Vec::new() })
+        .collect();
+    let stage_query = |cap: u8| Query { priority: 0, keep_defense: min_def > 0, excluded: &stage_ex[cap as usize], ..q };
+    let mut stage = Stage { cap: 0, lines: Vec::new(), kept: 0, nodes: 0 };
+    let mut s = match Searcher::new(&gd.armor, &gd.jewels, &if staged { stage_query(0) } else { Query { ..q } }) {
         Ok(s) => s,
         Err(e) => {
             println!("ERROR {e:?}");
@@ -257,7 +282,28 @@ fn main() {
             // Measurement: per phase nodes, combinations reaching the end, decoration placement work, per level (groups, groups after dominance)
             println!("PROFILE {mode} nodes {} leaves {} deco {} ms {:.1} groups {:?}", s.nodes, s.leaves, s.deco_nodes, t0.elapsed().as_secs_f64() * 1e3, s.group_counts);
         }
-        if s.results().is_empty() && status == Status::Done && want_needed && mode == "owned" {
+        if staged && mode == "owned" && status == Status::Done {
+            // Keep this stage's sets of exactly its rarity, then the next stage while the results are not full
+            let max = q.max_results;
+            for r in s.sorted_results() {
+                if stage.kept >= max {
+                    break;
+                }
+                if skillsim_engine::search::set_rarity(&s, &gd.armor, &owned_sorted, &r) == stage.cap {
+                    stage.lines.push(set_line(&gd, &s, mode, min_def, "SET", &r));
+                    stage.lines.extend(r.variants.iter().map(|v| set_line(&gd, &s, mode, min_def, "VAR", v)));
+                    stage.kept += 1;
+                }
+            }
+            if stage.kept < max && stage.cap < stage_max {
+                stage.nodes += s.nodes;
+                stage.cap += 1;
+                s = Searcher::new(&gd.armor, &gd.jewels, &stage_query(stage.cap)).unwrap();
+                continue;
+            }
+        }
+        let staged_empty = staged && mode == "owned" && stage.kept == 0;
+        if (if staged && mode == "owned" { staged_empty } else { s.results().is_empty() }) && status == Status::Done && want_needed && mode == "owned" {
             // ask=1 (window run): ask before moving to unowned charms. "n" = search, anything else = end with no results
             if let (Some(rx), true) = (&commands, get("ask", "0") == "1") {
                 println!("ASKNEEDED");
@@ -273,7 +319,7 @@ fn main() {
         if status == Status::Done {
             break;
         }
-        print_block(&gd, &s, mode, min_def, status, t0);
+        print_out(&gd, &s, mode, min_def, status, t0, staged, &stage);
         println!("PAUSED");
         let cmd = rx.recv().unwrap_or_default();
         let f: Vec<&str> = cmd.split(' ').collect();
@@ -288,9 +334,39 @@ fn main() {
         deadline = Instant::now() + time_limit;
         nodes_left = node_limit;
     }
-    print_block(&gd, &s, mode, min_def, status, t0);
+    print_out(&gd, &s, mode, min_def, status, t0, staged, &stage);
     if interactive {
         println!("END");
+    }
+}
+
+/// Kept sets of finished stages (rarity priority in stages)
+struct Stage {
+    cap: u8,
+    lines: Vec<String>,
+    kept: usize,
+    /// Nodes of finished stages
+    nodes: u64,
+}
+
+/// Results: from the stages (owned-charm phase of rarity priority) or from the searcher
+#[allow(clippy::too_many_arguments)]
+fn print_out(gd: &GameData, s: &Searcher<'_>, mode: &str, min_def: u16, status: Status, t0: Instant, staged: bool, stage: &Stage) {
+    if !(staged && mode == "owned") {
+        print_block(gd, s, mode, min_def, status, t0);
+        return;
+    }
+    println!(
+        "STAT {} {} {:.1} {mode}",
+        if status == Status::Done { "done" } else { "paused" },
+        stage.nodes + s.nodes,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    for l in &stage.lines {
+        println!("{l}");
+    }
+    for r in s.front() {
+        print_set(gd, s, mode, min_def, "BEST", &r);
     }
 }
 

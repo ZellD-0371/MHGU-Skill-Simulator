@@ -50,16 +50,9 @@ impl Set {
         usize::try_from(self.charm).ok().and_then(|i| db.inv().charms.get(i).copied())
     }
 
-    /// Number of parts to craft (armor not in the equipment box)
-    /// Parts to make at the smithy: not owned, and not reward armor (that one is obtained another way: reward_parts)
+    /// Parts to make at the smithy: not owned, and not reward armor (that one is obtained another way)
     pub fn craft(&self, db: &Db) -> usize {
         (0..PARTS).filter(|&p| !db.inv().owned.contains(&self.head(p)) && !db.reward_armor.contains(&self.head(p))).count()
-    }
-
-    /// Parts that are reward armor not owned yet (only when the search allowed them)
-    #[allow(dead_code)]
-    pub fn reward_parts(&self, db: &Db) -> usize {
-        (0..PARTS).filter(|&p| !db.inv().owned.contains(&self.head(p)) && db.reward_armor.contains(&self.head(p))).count()
     }
 
     /// Highest rarity among armor to craft
@@ -148,8 +141,8 @@ impl Set {
 
     /// Could the free slots activate one more skill level (a new skill or the next level of one)?
     /// Optimistic: decoration side effects are ignored, so 'false' means the free slots are certainly of no use.
-    /// jewel_rank: decorations craftable up to this rank (1 low, 2 high, 3 G).
-    pub fn free_slots_useful(&self, db: &Db, jewel_rank: u8) -> bool {
+    /// use_: the decorations the search could use (rank, smithy list).
+    pub fn free_slots_useful(&self, db: &Db, use_: &crate::db::JewelUse) -> bool {
         // (capacity, multiplier): decorations in the torso count once more per torso-up part
         let (placed, caps) = self.placement(db);
         let copies = self.torso_copies(db);
@@ -165,7 +158,7 @@ impl Set {
         let totals = self.totals(db);
         // Per tree: the most points that fit in a container of capacity 1, 2, 3 (several decorations allowed)
         let mut best: BTreeMap<u16, [i16; 4]> = BTreeMap::new();
-        for j in db.gd.jewels.iter().filter(|j| j.rank <= jewel_rank && j.pos.pt > 0) {
+        for j in db.gd.jewels.iter().filter(|j| use_.allows(j) && j.pos.pt > 0) {
             let e = best.entry(j.pos.tree).or_insert([0; 4]);
             for cap in 1..=3usize {
                 let n = cap / j.size.max(1) as usize;

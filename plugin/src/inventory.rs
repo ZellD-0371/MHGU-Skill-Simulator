@@ -159,6 +159,87 @@ pub fn read(base: u32) -> Option<Inv> {
             *inv.items.entry(item).or_insert(0) += count as u32;
         }
     }
+    inv.smithy = smithy_unlock(base);
     inv.loaded = true;
     Some(inv)
+}
+
+/// 'Obtained at least once' item bitset: [base + OBTAINED] + 0x9C, bit = game item number (0x178 bytes).
+/// Set by the item box add code (0x1943D4), read by the smithy list code (0x19443C).
+const OBTAINED: u32 = 0x18583a8;
+/// Made-before bitsets: [base + MADE] + 0x16C8 + (part - 1) * 0x360, bit = recipe index * 4 + variant (0x5249F4)
+const MADE: u32 = 0x1897f78;
+/// Game functions for an armor recipe's open condition (mDispFlag): does it pass, and does it ask for the key materials
+const COND_OPEN: u32 = 0x5615bc;
+const COND_NEEDS_KEYS: u32 = 0x561838;
+
+/// The game state the smithy lists depend on
+pub struct SmithyMem {
+    obtained: u32,
+    made: u32,
+    open: extern "C" fn(u32) -> u32,
+    needs_keys: extern "C" fn(u32) -> u32,
+}
+
+impl SmithyMem {
+    /// None if the game objects are not there
+    pub fn read(base: u32) -> Option<Self> {
+        let obtained = unsafe { rd(base + OBTAINED) };
+        let made = unsafe { rd(base + MADE) };
+        if !valid(obtained) || !valid(made) {
+            return None;
+        }
+        let open = unsafe { core::mem::transmute::<u32, extern "C" fn(u32) -> u32>(base + COND_OPEN) };
+        let needs_keys = unsafe { core::mem::transmute::<u32, extern "C" fn(u32) -> u32>(base + COND_NEEDS_KEYS) };
+        Some(Self { obtained, made, open, needs_keys })
+    }
+    /// Was this game item obtained at least once
+    pub fn got(&self, item: u16) -> bool {
+        item < 0x178 * 8 && unsafe { byte(self.obtained + 0x9c + item as u32 / 8) } >> (item % 8) & 1 == 1
+    }
+    /// Decoration recipe (its key materials) listed
+    pub fn deco_shown(&self, keys: &[u16]) -> bool {
+        keys.iter().all(|&k| self.got(k))
+    }
+    /// Armor recipe variant listed (game 0x6FA928): made before, or the open condition passes and, if that condition asks
+    /// for it, every key material was obtained. `conds` remembers the condition answers (they only read game state).
+    pub fn armor_shown(&self, part: u8, bit: u16, cond: u16, keys: &[u16], conds: &mut alloc::collections::BTreeMap<u16, (bool, bool)>) -> bool {
+        let off = 0x16c8 + (part as u32 - 1) * 0x360 + bit as u32 / 8;
+        let made = bit < 0x360 * 8 && unsafe { byte(self.made + off) } >> (bit % 8) & 1 == 1;
+        made || {
+            let (pass, ask) = *conds.entry(cond).or_insert_with(|| ((self.open)(cond as u32) & 0xff == 1, (self.needs_keys)(cond as u32) & 0xff == 1));
+            pass && (!ask || keys.iter().all(|&k| self.got(k)))
+        }
+    }
+}
+
+/// What the smithy lists right now, computed the same way as the game's list code (docs/smithy-deco-unlock-analysis.md):
+/// decorations whose key materials were all obtained once; armor made before, or whose open condition passes and
+/// (when the condition asks for it) whose key materials were all obtained once.
+/// Runs on the game thread when the window opens. None if the game objects are not there.
+fn smithy_unlock(base: u32) -> Option<crate::db::Smithy> {
+    use crate::generated::unlock::{ARMOR_KEYS, DECO_KEYS};
+    let m = SmithyMem::read(base)?;
+    let mut out = crate::db::Smithy::default();
+    for &(jewel, keys) in DECO_KEYS {
+        if m.deco_shown(keys) {
+            out.jewels.insert(jewel);
+            out.deco_recipes += 1;
+        }
+    }
+    let mut conds = alloc::collections::BTreeMap::new();
+    for &(armor, part, bit, cond, keys) in ARMOR_KEYS {
+        if !out.armor.contains(&armor) && m.armor_shown(part, bit, cond, keys, &mut conds) {
+            out.armor.insert(armor);
+        }
+    }
+    // FNV-1a over both lists
+    let mut h: u64 = 0xcbf29ce484222325;
+    for x in out.armor.iter().chain([&0u16]).chain(out.jewels.iter()) {
+        for b in x.to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    out.sig = h;
+    Some(out)
 }
